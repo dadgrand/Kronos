@@ -1,4 +1,10 @@
 # historical_backtest.py
+"""Research-only toy script.
+
+This file intentionally uses a random-walk placeholder instead of Kronos model
+predictions. It is not a validated trading backtest and is gated so it cannot be
+mistaken for a production trading pipeline.
+"""
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -19,6 +25,11 @@ class HistoricalBacktester:
     """
 
     def __init__(self, data_dir, initial_capital=100000):
+        if os.environ.get("KRONOS_RUN_RESEARCH_DEMO") != "1":
+            raise RuntimeError(
+                "HistoricalBacktester is research-only and uses random-walk placeholder predictions. "
+                "Set KRONOS_RUN_RESEARCH_DEMO=1 only for intentional demos."
+            )
         self.data_dir = data_dir
         self.initial_capital = initial_capital
 
@@ -335,6 +346,13 @@ class HistoricalBacktester:
 
 def main():
     """主函数"""
+    if os.environ.get("KRONOS_RUN_RESEARCH_DEMO") != "1":
+        raise RuntimeError(
+            "examples/yuce/historical_backtest.py is a research-only toy script. "
+            "Set KRONOS_RUN_RESEARCH_DEMO=1 only when you intentionally want to run "
+            "the random-walk demonstration."
+        )
+
     # 配置参数
     BACKTEST_CONFIG = {
         "stock_code": "300418",

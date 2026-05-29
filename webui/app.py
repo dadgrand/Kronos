@@ -1,4 +1,5 @@
 import os
+import hashlib
 import pandas as pd
 import numpy as np
 import json
@@ -12,7 +13,9 @@ import datetime
 warnings.filterwarnings('ignore')
 
 # Add project root directory to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_ROOT = os.path.abspath(os.environ.get('KRONOS_DATA_ROOT', os.path.join(PROJECT_ROOT, 'data')))
+sys.path.append(PROJECT_ROOT)
 
 try:
     from model import Kronos, KronosTokenizer, KronosPredictor
@@ -22,12 +25,64 @@ except ImportError:
     print("Warning: Kronos model cannot be imported, will use simulated data for demonstration")
 
 app = Flask(__name__)
-CORS(app)
+if os.environ.get('KRONOS_ENABLE_CORS', '0') == '1':
+    CORS(app)
 
 # Global variables to store models
 tokenizer = None
 model = None
 predictor = None
+loaded_model_info = None
+
+def resolve_data_file_path(file_path):
+    """Resolve a user-supplied data path under the configured data root."""
+    if not file_path:
+        raise ValueError("File path cannot be empty")
+
+    resolved_path = os.path.abspath(file_path)
+    data_root = os.path.abspath(DATA_ROOT)
+    try:
+        common_path = os.path.commonpath([resolved_path, data_root])
+    except ValueError as exc:
+        raise ValueError("File path is outside the configured data root") from exc
+
+    if common_path != data_root:
+        raise ValueError(
+            f"File path is outside the configured data root: {data_root}. "
+            "Set KRONOS_DATA_ROOT if you need to use another directory."
+        )
+    return resolved_path
+
+def infer_time_delta(df):
+    """Infer a stable timestamp step for future prediction timestamps."""
+    if 'timestamps' not in df.columns or len(df) < 2:
+        return pd.Timedelta(hours=1)
+
+    diffs = df['timestamps'].diff().dropna()
+    if diffs.empty:
+        return pd.Timedelta(hours=1)
+    return diffs.median()
+
+def build_model_info(model_key, model_config):
+    """Build stable model provenance metadata for saved predictions."""
+    payload = {
+        'model_key': model_key,
+        'model_id': model_config['model_id'],
+        'tokenizer_id': model_config['tokenizer_id'],
+        'model_revision': model_config['model_revision'],
+        'tokenizer_revision': model_config['tokenizer_revision'],
+        'context_length': model_config['context_length'],
+    }
+    payload_json = json.dumps(payload, sort_keys=True)
+    return {
+        'model_key': model_key,
+        'model_version': model_config['model_id'],
+        'model_hash': hashlib.sha256(payload_json.encode('utf-8')).hexdigest(),
+        'tokenizer_id': model_config['tokenizer_id'],
+        'model_revision': model_config['model_revision'],
+        'tokenizer_revision': model_config['tokenizer_revision'],
+        'context_length': model_config['context_length'],
+    }
 
 # Available model configurations
 AVAILABLE_MODELS = {
@@ -43,6 +98,8 @@ AVAILABLE_MODELS = {
         'name': 'Kronos-small',
         'model_id': 'NeoQuasar/Kronos-small',
         'tokenizer_id': 'NeoQuasar/Kronos-Tokenizer-base',
+        'model_revision': '901c26c1332695a2a8f243eb2f37243a37bea320',
+        'tokenizer_revision': '0e0117387f39004a9016484a186a908917e22426',
         'context_length': 512,
         'params': '24.7M',
         'description': 'Small model, balanced performance and speed'
@@ -59,7 +116,7 @@ AVAILABLE_MODELS = {
 
 def load_data_files():
     """Scan data directory and return available data files"""
-    data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
+    data_dir = DATA_ROOT
     data_files = []
     
     if os.path.exists(data_dir):
@@ -78,6 +135,7 @@ def load_data_files():
 def load_data_file(file_path):
     """Load data file"""
     try:
+        file_path = resolve_data_file_path(file_path)
         if file_path.endswith('.csv'):
             df = pd.read_csv(file_path)
         elif file_path.endswith('.feather'):
@@ -101,6 +159,9 @@ def load_data_file(file_path):
         else:
             # If no timestamp column exists, create one
             df['timestamps'] = pd.date_range(start='2024-01-01', periods=len(df), freq='1H')
+
+        df = df.dropna(subset=['timestamps'])
+        df = df.sort_values('timestamps').reset_index(drop=True)
         
         # Ensure numeric columns are numeric type
         for col in ['open', 'high', 'low', 'close']:
@@ -114,7 +175,7 @@ def load_data_file(file_path):
         if 'amount' in df.columns:
             df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
         
-        # Remove rows containing NaN values
+        # Remove rows containing NaN values after sorting into chronological order
         df = df.dropna()
         
         return df, None
@@ -137,6 +198,7 @@ def save_prediction_results(file_path, prediction_type, prediction_results, actu
         # Prepare data for saving
         save_data = {
             'timestamp': datetime.datetime.now().isoformat(),
+            'contract_schema_version': 'kronos-prediction-contract-v1',
             'file_path': file_path,
             'prediction_type': prediction_type,
             'prediction_params': prediction_params,
@@ -414,6 +476,17 @@ def predict():
         temperature = float(data.get('temperature', 1.0))
         top_p = float(data.get('top_p', 0.9))
         sample_count = int(data.get('sample_count', 1))
+
+        if not 1 <= lookback <= 4096:
+            return jsonify({'error': 'lookback must be between 1 and 4096'}), 400
+        if not 1 <= pred_len <= 1024:
+            return jsonify({'error': 'pred_len must be between 1 and 1024'}), 400
+        if not 0.05 <= temperature <= 5.0:
+            return jsonify({'error': 'temperature must be between 0.05 and 5.0'}), 400
+        if not 0.0 < top_p <= 1.0:
+            return jsonify({'error': 'top_p must be in the interval (0, 1]'}), 400
+        if not 1 <= sample_count <= 20:
+            return jsonify({'error': 'sample_count must be between 1 and 20'}), 400
         
         if not file_path:
             return jsonify({'error': 'File path cannot be empty'}), 400
@@ -428,6 +501,8 @@ def predict():
         
         # Perform prediction
         if MODEL_AVAILABLE and predictor is not None:
+            if loaded_model_info is None:
+                return jsonify({'error': 'Loaded model provenance is missing; reload the model first'}), 500
             try:
                 # Use real Kronos model
                 # Only use necessary columns: OHLCV, excluding amount
@@ -464,11 +539,20 @@ def predict():
                     
                     prediction_type = f"Kronos model prediction (within selected window: first {lookback} data points for prediction, last {pred_len} data points for comparison, time span: {time_span})"
                 else:
-                    # Use latest data
-                    x_df = df.iloc[:lookback][required_cols]
-                    x_timestamp = df.iloc[:lookback]['timestamps']
-                    y_timestamp = df.iloc[lookback:lookback+pred_len]['timestamps']
-                    prediction_type = "Kronos model prediction (latest data)"
+                    # Use the latest available context and forecast truly future timestamps.
+                    context_start = len(df) - lookback
+                    x_df = df.iloc[context_start:][required_cols]
+                    x_timestamp = df.iloc[context_start:]['timestamps']
+                    time_diff = infer_time_delta(df)
+                    y_timestamp = pd.Series(
+                        pd.date_range(
+                            start=x_timestamp.iloc[-1] + time_diff,
+                            periods=pred_len,
+                            freq=time_diff
+                        ),
+                        name='timestamps'
+                    )
+                    prediction_type = "Kronos model prediction (latest available context, no realized comparison)"
                 
                 # Ensure timestamps are Series format, not DatetimeIndex, to avoid .dt attribute error in Kronos model
                 if isinstance(x_timestamp, pd.DatetimeIndex):
@@ -520,20 +604,8 @@ def predict():
                         'amount': float(row['amount']) if 'amount' in row else 0
                     })
         else:  # Latest data
-            # Prediction uses first 400 data points
-            # Actual data should be 120 data points after first 400 data points
-            if len(df) >= lookback + pred_len:
-                actual_df = df.iloc[lookback:lookback+pred_len]
-                for i, (_, row) in enumerate(actual_df.iterrows()):
-                    actual_data.append({
-                        'timestamp': row['timestamps'].isoformat(),
-                        'open': float(row['open']),
-                        'high': float(row['high']),
-                        'low': float(row['low']),
-                        'close': float(row['close']),
-                        'volume': float(row['volume']) if 'volume' in row else 0,
-                        'amount': float(row['amount']) if 'amount' in row else 0
-                    })
+            # Latest forecasts are future-only, so there is no realized comparison yet.
+            actual_df = None
         
         # Create chart - pass historical data start position
         if start_date:
@@ -542,50 +614,40 @@ def predict():
             mask = df['timestamps'] >= start_dt
             historical_start_idx = df[mask].index[0] if len(df[mask]) > 0 else 0
         else:
-            # Latest data: start from beginning
-            historical_start_idx = 0
+            # Latest data: show the last lookback rows as context.
+            historical_start_idx = max(len(df) - lookback, 0)
         
         chart_json = create_prediction_chart(df, pred_df, lookback, pred_len, actual_df, historical_start_idx)
         
-        # Prepare prediction result data - fix timestamp calculation logic
-        if 'timestamps' in df.columns:
-            if start_date:
-                # Custom time period: use selected window data to calculate timestamps
-                start_dt = pd.to_datetime(start_date)
-                mask = df['timestamps'] >= start_dt
-                time_range_df = df[mask]
-                
-                if len(time_range_df) >= lookback:
-                    # Calculate prediction timestamps starting from last time point of selected window
-                    last_timestamp = time_range_df['timestamps'].iloc[lookback-1]
-                    time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0]
-                    future_timestamps = pd.date_range(
-                        start=last_timestamp + time_diff,
-                        periods=pred_len,
-                        freq=time_diff
-                    )
-                else:
-                    future_timestamps = []
-            else:
-                # Latest data: calculate from last time point of entire data file
-                last_timestamp = df['timestamps'].iloc[-1]
-                time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0]
-                future_timestamps = pd.date_range(
-                    start=last_timestamp + time_diff,
-                    periods=pred_len,
-                    freq=time_diff
-                )
-        else:
-            future_timestamps = range(len(df), len(df) + pred_len)
-        
         prediction_results = []
-        for i, (_, row) in enumerate(pred_df.iterrows()):
+        for i, (timestamp, row) in enumerate(pred_df.iterrows()):
+            target_timestamp = pd.Timestamp(timestamp)
+            prediction_asof = pd.Timestamp(x_timestamp.iloc[-1])
+            horizon = target_timestamp - prediction_asof
+            symbol = str(data.get('symbol') or os.path.splitext(os.path.basename(file_path))[0])
+            model_info = loaded_model_info
+            if hasattr(timestamp, 'isoformat'):
+                timestamp_value = timestamp.isoformat()
+            else:
+                timestamp_value = str(timestamp)
             prediction_results.append({
-                'timestamp': future_timestamps[i].isoformat() if i < len(future_timestamps) else f"T{i}",
+                'timestamp': timestamp_value,
+                'symbol': symbol,
+                'prediction_asof': prediction_asof.isoformat(),
+                'features_cutoff': prediction_asof.isoformat(),
+                'execution_timestamp': target_timestamp.isoformat(),
+                'target_timestamp': target_timestamp.isoformat(),
+                'horizon': str(horizon),
+                'model_version': model_info['model_version'],
+                'model_hash': model_info['model_hash'],
+                'tokenizer_id': model_info['tokenizer_id'],
+                'model_revision': model_info['model_revision'],
+                'tokenizer_revision': model_info['tokenizer_revision'],
                 'open': float(row['open']),
                 'high': float(row['high']),
                 'low': float(row['low']),
                 'close': float(row['close']),
+                'predicted_close': float(row['close']),
                 'volume': float(row['volume']) if 'volume' in row else 0,
                 'amount': float(row['amount']) if 'amount' in row else 0
             })
@@ -626,7 +688,7 @@ def predict():
 @app.route('/api/load-model', methods=['POST'])
 def load_model():
     """Load Kronos model"""
-    global tokenizer, model, predictor
+    global tokenizer, model, predictor, loaded_model_info
     
     try:
         if not MODEL_AVAILABLE:
@@ -640,13 +702,25 @@ def load_model():
             return jsonify({'error': f'Unsupported model: {model_key}'}), 400
         
         model_config = AVAILABLE_MODELS[model_key]
+        model_revision = data.get('model_revision') or model_config.get('model_revision')
+        tokenizer_revision = data.get('tokenizer_revision') or model_config.get('tokenizer_revision')
+
+        if not model_revision or model_revision == 'main':
+            return jsonify({'error': 'Pinned model_revision is required for reproducible predictions'}), 400
+        if not tokenizer_revision or tokenizer_revision == 'main':
+            return jsonify({'error': 'Pinned tokenizer_revision is required for reproducible predictions'}), 400
+
+        model_config = dict(model_config)
+        model_config['model_revision'] = model_revision
+        model_config['tokenizer_revision'] = tokenizer_revision
         
         # Load tokenizer and model
-        tokenizer = KronosTokenizer.from_pretrained(model_config['tokenizer_id'])
-        model = Kronos.from_pretrained(model_config['model_id'])
+        tokenizer = KronosTokenizer.from_pretrained(model_config['tokenizer_id'], revision=tokenizer_revision)
+        model = Kronos.from_pretrained(model_config['model_id'], revision=model_revision)
         
         # Create predictor
         predictor = KronosPredictor(model, tokenizer, device=device, max_context=model_config['context_length'])
+        loaded_model_info = build_model_info(model_key, model_config)
         
         return jsonify({
             'success': True,
@@ -655,6 +729,8 @@ def load_model():
                 'name': model_config['name'],
                 'params': model_config['params'],
                 'context_length': model_config['context_length'],
+                'model_version': loaded_model_info['model_version'],
+                'model_hash': loaded_model_info['model_hash'],
                 'description': model_config['description']
             }
         })
@@ -681,7 +757,11 @@ def get_model_status():
                 'message': 'Kronos model loaded and available',
                 'current_model': {
                     'name': predictor.model.__class__.__name__,
-                    'device': str(next(predictor.model.parameters()).device)
+                    'device': str(next(predictor.model.parameters()).device),
+                    'model_version': loaded_model_info['model_version'] if loaded_model_info else None,
+                    'model_hash': loaded_model_info['model_hash'] if loaded_model_info else None,
+                    'model_revision': loaded_model_info['model_revision'] if loaded_model_info else None,
+                    'tokenizer_revision': loaded_model_info['tokenizer_revision'] if loaded_model_info else None
                 }
             })
         else:
@@ -705,4 +785,7 @@ if __name__ == '__main__':
     else:
         print("Tip: Will use simulated data for demonstration")
     
-    app.run(debug=True, host='0.0.0.0', port=7070)
+    host = os.environ.get('KRONOS_WEB_HOST', '127.0.0.1')
+    port = int(os.environ.get('KRONOS_WEB_PORT', '7070'))
+    debug = os.environ.get('FLASK_DEBUG', '0') == '1'
+    app.run(debug=debug, host=host, port=port)

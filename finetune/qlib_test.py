@@ -6,7 +6,10 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
-import torch
+import pytest
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("qlib")
 from torch.utils.data import Dataset, DataLoader
 from tqdm import trange, tqdm
 from matplotlib import pyplot as plt

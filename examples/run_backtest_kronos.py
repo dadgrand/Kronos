@@ -1,454 +1,580 @@
-# run_backtest.py
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
+# run_backtest_kronos.py
+"""Conservative historical backtest helper for Kronos prediction files.
+
+This script is intentionally limited: it can backtest only predictions whose
+target timestamps overlap realized historical prices. Future-only forecasts are
+not a backtest and are rejected instead of being marked to model-generated prices.
+"""
+
+import json
 import os
-from datetime import datetime, timedelta
+import glob
 import warnings
 
-warnings.filterwarnings('ignore')
+import numpy as np
+import pandas as pd
 
-# 设置中文字体
-plt.rcParams['font.sans-serif'] = ['SimHei']
-plt.rcParams['axes.unicode_minus'] = False
+from trading.paper import BUY, SELL, MarketBar, PaperBroker, PaperRiskManager
+
+warnings.filterwarnings("ignore")
 
 
 class KronosBacktester:
-    """
-    Kronos模型回测类
-    """
+    """Historical long/flat backtester for prediction CSVs."""
 
-    def __init__(self, data_dir, model_dir, initial_capital=100000):
-        """
-        初始化回测器
+    REQUIRED_PREDICTION_COLUMNS = {
+        "symbol",
+        "prediction_asof",
+        "execution_timestamp",
+        "target_timestamp",
+        "features_cutoff",
+        "horizon",
+        "model_version",
+        "model_hash",
+        "predicted_close",
+    }
 
-        参数:
-        data_dir: 数据目录
-        model_dir: 模型预测结果目录
-        initial_capital: 初始资金
-        """
+    def __init__(
+        self,
+        data_dir,
+        model_dir,
+        initial_capital=100000,
+        commission_rate=0.001,
+        slippage_rate=0.0005,
+        max_position_fraction=0.25,
+        min_cash_fraction=0.01,
+        max_drawdown_stop=0.2,
+        max_participation_rate=0.1,
+        default_bar_volume=1_000_000,
+        allow_short=False,
+    ):
+        if initial_capital <= 0:
+            raise ValueError("initial_capital must be positive.")
+        if not 0 <= commission_rate < 1:
+            raise ValueError("commission_rate must be in [0, 1).")
+        if not 0 <= slippage_rate < 1:
+            raise ValueError("slippage_rate must be in [0, 1).")
+        if not 0 < max_position_fraction <= 1:
+            raise ValueError("max_position_fraction must be in (0, 1].")
+        if not 0 <= min_cash_fraction < 1:
+            raise ValueError("min_cash_fraction must be in [0, 1).")
+        if not 0 < max_drawdown_stop < 1:
+            raise ValueError("max_drawdown_stop must be in (0, 1).")
+        if not 0 < max_participation_rate <= 1:
+            raise ValueError("max_participation_rate must be in (0, 1].")
+        if default_bar_volume <= 0:
+            raise ValueError("default_bar_volume must be positive.")
+        if allow_short:
+            raise ValueError("Short backtests require an explicit margin, borrow, and locate model.")
+
         self.data_dir = data_dir
         self.model_dir = model_dir
-        self.initial_capital = initial_capital
-        self.results = {}
+        self.initial_capital = float(initial_capital)
+        self.commission_rate = commission_rate
+        self.slippage_rate = slippage_rate
+        self.max_position_fraction = max_position_fraction
+        self.min_cash_fraction = min_cash_fraction
+        self.max_drawdown_stop = max_drawdown_stop
+        self.max_participation_rate = max_participation_rate
+        self.default_bar_volume = default_bar_volume
+        self.allow_short = False
 
     def load_historical_data(self, stock_code):
-        """
-        加载历史数据
-        """
         csv_file = os.path.join(self.data_dir, f"{stock_code}_stock_data.csv")
         if not os.path.exists(csv_file):
-            raise FileNotFoundError(f"数据文件不存在: {csv_file}")
+            raise FileNotFoundError(f"Historical data file does not exist: {csv_file}")
 
-        df = pd.read_csv(csv_file, encoding='utf-8-sig')
-
-        # 检查列名并标准化
+        df = pd.read_csv(csv_file, encoding="utf-8-sig")
         column_mapping = {
-            '日期': 'date',
-            '开盘价': 'open',
-            '最高价': 'high',
-            '最低价': 'low',
-            '收盘价': 'close',
-            '成交量': 'volume',
-            '成交额': 'amount'
+            "date": "date",
+            "timestamp": "date",
+            "timestamps": "date",
+            "日期": "date",
+            "开盘价": "open",
+            "最高价": "high",
+            "最低价": "low",
+            "收盘价": "close",
+            "成交量": "volume",
+            "成交额": "amount",
         }
-
-        # 重命名列
         for old_col, new_col in column_mapping.items():
             if old_col in df.columns:
                 df = df.rename(columns={old_col: new_col})
 
-        df['date'] = pd.to_datetime(df['date'])
-        df.set_index('date', inplace=True)
-        df = df.sort_index()
+        required_cols = {"date", "close"}
+        missing = required_cols - set(df.columns)
+        if missing:
+            raise ValueError(f"Historical data is missing required columns: {sorted(missing)}")
+        if "open" not in df.columns:
+            df["open"] = df["close"]
 
-        print(f"✅ 加载历史数据: {len(df)} 条记录")
-        print(f"时间范围: {df.index.min()} 到 {df.index.max()}")
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        df[["open", "close"]] = df[["open", "close"]].apply(pd.to_numeric, errors="coerce")
+        df = df.dropna(subset=["open", "close"])
 
+        print(f"Loaded historical rows: {len(df)}")
+        print(f"Historical range: {df.index.min()} to {df.index.max()}")
         return df
 
     def load_predictions(self, stock_code):
-        """
-        加载模型预测结果
-        """
-        # 尝试不同的预测文件命名
         pred_files = [
             os.path.join(self.model_dir, f"{stock_code}_kronos_predictions.csv"),
+            os.path.join(self.model_dir, f"{stock_code}_kronos_predictions.json"),
             os.path.join(self.model_dir, f"{stock_code}_detailed_predictions.csv"),
-            os.path.join(self.model_dir, f"{stock_code}_predictions.csv")
+            os.path.join(self.model_dir, f"{stock_code}_detailed_predictions.json"),
+            os.path.join(self.model_dir, f"{stock_code}_predictions.csv"),
+            os.path.join(self.model_dir, f"{stock_code}_predictions.json"),
         ]
+        pred_files.extend(
+            sorted(
+                glob.glob(os.path.join(self.model_dir, "prediction_*.json")),
+                key=os.path.getmtime,
+                reverse=True,
+            )
+        )
 
         pred_df = None
         for pred_file in pred_files:
             if os.path.exists(pred_file):
-                pred_df = pd.read_csv(pred_file, encoding='utf-8-sig')
-                print(f"✅ 找到预测文件: {pred_file}")
+                if pred_file.endswith(".json"):
+                    with open(pred_file, "r", encoding="utf-8") as f:
+                        payload = json.load(f)
+                    pred_df = pd.DataFrame(payload.get("prediction_results", payload))
+                else:
+                    pred_df = pd.read_csv(pred_file, encoding="utf-8-sig")
+                print(f"Loaded prediction file: {pred_file}")
                 break
 
         if pred_df is None:
-            raise FileNotFoundError(f"未找到预测文件，请检查目录: {self.model_dir}")
+            raise FileNotFoundError(f"No prediction file found in: {self.model_dir}")
 
-        # 标准化列名
         column_mapping = {
-            '日期': 'date',
-            '预测收盘价': 'predicted_close',
-            '收盘价': 'predicted_close',
-            '预测成交量': 'predicted_volume',
-            '成交量': 'predicted_volume'
+            "date": "target_timestamp",
+            "timestamp": "target_timestamp",
+            "timestamps": "target_timestamp",
+            "日期": "target_timestamp",
+            "target": "target_timestamp",
+            "target_date": "target_timestamp",
+            "execution_time": "execution_timestamp",
+            "execution_date": "execution_timestamp",
+            "trade_timestamp": "execution_timestamp",
+            "asof": "prediction_asof",
+            "generated_at": "prediction_asof",
+            "feature_cutoff": "features_cutoff",
+            "预测收盘价": "predicted_close",
+            "收盘价": "predicted_close",
+            "close": "predicted_close",
         }
-
         for old_col, new_col in column_mapping.items():
-            if old_col in pred_df.columns:
+            if old_col in pred_df.columns and new_col not in pred_df.columns:
                 pred_df = pred_df.rename(columns={old_col: new_col})
 
-        pred_df['date'] = pd.to_datetime(pred_df['date'])
-        pred_df.set_index('date', inplace=True)
-        pred_df = pred_df.sort_index()
+        missing = self.REQUIRED_PREDICTION_COLUMNS - set(pred_df.columns)
+        if missing:
+            raise ValueError(
+                "Prediction data is missing the strict as-of contract columns: "
+                f"{sorted(missing)}"
+            )
 
-        print(f"✅ 加载预测数据: {len(pred_df)} 条记录")
-        print(f"预测时间范围: {pred_df.index.min()} 到 {pred_df.index.max()}")
+        pred_df["symbol"] = pred_df["symbol"].astype(str)
+        if stock_code and not (pred_df["symbol"] == str(stock_code)).all():
+            raise ValueError(f"Prediction symbols must all match requested stock_code={stock_code}.")
 
+        for col in ("prediction_asof", "execution_timestamp", "target_timestamp", "features_cutoff"):
+            pred_df[col] = pd.to_datetime(pred_df[col])
+
+        pred_df["predicted_close"] = pd.to_numeric(pred_df["predicted_close"], errors="coerce")
+        pred_df = self.validate_prediction_contract(pred_df)
+        pred_df = pred_df.set_index("execution_timestamp", drop=False).sort_index()
+        pred_df = pred_df.dropna(subset=["predicted_close"])
+
+        print(f"Loaded prediction rows: {len(pred_df)}")
+        print(f"Prediction range: {pred_df.index.min()} to {pred_df.index.max()}")
         return pred_df
 
+    def validate_prediction_contract(self, pred_df):
+        missing = self.REQUIRED_PREDICTION_COLUMNS - set(pred_df.columns)
+        if missing:
+            raise ValueError(
+                "Prediction data is missing the strict as-of contract columns: "
+                f"{sorted(missing)}"
+            )
+
+        checked = pred_df.copy()
+        if "target_timestamp" not in checked.columns:
+            checked["target_timestamp"] = checked.index
+        if "execution_timestamp" not in checked.columns:
+            checked["execution_timestamp"] = checked.index
+
+        for col in ("prediction_asof", "execution_timestamp", "target_timestamp", "features_cutoff"):
+            checked[col] = pd.to_datetime(checked[col])
+
+        checked["predicted_close"] = pd.to_numeric(checked["predicted_close"], errors="coerce")
+        checked = checked.dropna(subset=["predicted_close"])
+
+        if checked.empty:
+            raise ValueError("Prediction data is empty after parsing numeric predictions.")
+        if checked["execution_timestamp"].duplicated().any():
+            raise ValueError("Prediction data contains duplicate execution_timestamp values.")
+        if not (checked["prediction_asof"] < checked["execution_timestamp"]).all():
+            raise ValueError("Every prediction_asof must be strictly before execution_timestamp.")
+        if not (checked["execution_timestamp"] <= checked["target_timestamp"]).all():
+            raise ValueError("execution_timestamp must be less than or equal to target_timestamp.")
+        if not (checked["execution_timestamp"] == checked["target_timestamp"]).all():
+            raise ValueError(
+                "This helper supports one-bar forecasts only: execution_timestamp must equal target_timestamp. "
+                "Use an event-driven backtester for multi-bar horizons."
+            )
+        if not (checked["features_cutoff"] <= checked["prediction_asof"]).all():
+            raise ValueError("features_cutoff must be less than or equal to prediction_asof.")
+        if not (checked["features_cutoff"] < checked["execution_timestamp"]).all():
+            raise ValueError("features_cutoff must be strictly before execution_timestamp.")
+
+        for col in ("symbol", "horizon", "model_version", "model_hash"):
+            values = checked[col].astype(str).str.strip()
+            placeholders = {"", "unknown", "none", "nan", "unversioned"}
+            if values.str.lower().isin(placeholders).any():
+                raise ValueError(f"{col} must be populated with non-placeholder values.")
+
+        horizon_delta = pd.to_timedelta(checked["horizon"], errors="coerce")
+        if horizon_delta.isna().any() or (horizon_delta <= pd.Timedelta(0)).any():
+            raise ValueError("horizon must be a positive pandas-compatible Timedelta string, e.g. '1D'.")
+        realized_horizon = checked["target_timestamp"] - checked["prediction_asof"]
+        if not (horizon_delta == realized_horizon).all():
+            raise ValueError("horizon must equal target_timestamp - prediction_asof for every row.")
+
+        return checked
+
     def align_data(self, hist_df, pred_df):
-        """
-        对齐历史数据和预测数据的时间范围
-        """
-        # 找到历史数据的最后日期
-        last_hist_date = hist_df.index.max()
+        """Return only dates where realized market prices and predictions coexist."""
+        common_index = hist_df.index.intersection(pred_df.index).sort_values()
+        if common_index.empty:
+            raise ValueError(
+                "Cannot run a historical backtest without overlapping actual and prediction dates. "
+                "Future-only forecasts can be inspected, but they cannot produce realized PnL."
+            )
 
-        # 筛选预测数据，从历史数据结束后开始
-        pred_df_aligned = pred_df[pred_df.index > last_hist_date]
+        print(
+            f"Aligned {len(common_index)} rows from {common_index.min()} to {common_index.max()} "
+            "using realized market prices only."
+        )
+        aligned_predictions = pred_df.loc[common_index].copy()
+        if "execution_timestamp" not in aligned_predictions.columns:
+            aligned_predictions["execution_timestamp"] = aligned_predictions.index
+        aligned_predictions = self.validate_prediction_contract(aligned_predictions)
 
-        if len(pred_df_aligned) == 0:
-            # 如果没有未来的预测数据，使用所有预测数据
-            pred_df_aligned = pred_df.copy()
-            print("⚠️ 警告：预测数据没有未来的日期，使用所有预测数据")
-
-        print(f"✅ 数据对齐: 历史数据结束于 {last_hist_date}, 预测数据从 {pred_df_aligned.index.min()} 开始")
-
-        return pred_df_aligned
+        return hist_df.loc[common_index].copy(), aligned_predictions.set_index("execution_timestamp", drop=False).sort_index()
 
     def calculate_trading_signals(self, hist_df, pred_df, threshold=0.02):
-        """
-        计算交易信号
-        """
-        # 对齐数据
-        pred_df = self.align_data(hist_df, pred_df)
+        """Build target positions from target-date forecasts without using target close as input."""
+        if threshold < 0:
+            raise ValueError("threshold must be non-negative.")
 
-        # 合并历史数据和预测数据
-        combined = pd.concat([
-            hist_df[['close']].rename(columns={'close': 'actual'}),
-            pred_df[['predicted_close']].rename(columns={'predicted_close': 'predicted'})
-        ], axis=1)
+        hist_df, pred_df = self.align_data(hist_df, pred_df)
+        combined = pd.DataFrame(index=hist_df.index)
+        combined["open"] = hist_df["open"].astype(float)
+        combined["actual"] = hist_df["close"].astype(float)
+        combined["volume"] = (
+            pd.to_numeric(hist_df["volume"], errors="coerce")
+            if "volume" in hist_df.columns
+            else float(self.default_bar_volume)
+        )
+        combined["symbol"] = pred_df["symbol"].astype(str)
+        combined["predicted"] = pred_df["predicted_close"].astype(float)
+        combined = combined.replace([np.inf, -np.inf], np.nan).dropna()
 
-        # 计算预测收益率
-        combined['pred_return'] = combined['predicted'].pct_change()
+        if len(combined) < 2:
+            raise ValueError("Need at least two aligned rows to compute forecast returns without look-ahead.")
 
-        # 生成交易信号
-        combined['signal'] = 0
-        combined['signal'] = np.where(combined['pred_return'] > threshold, 1,  # 买入信号
-                                      np.where(combined['pred_return'] < -threshold, -1, 0))  # 卖出信号
+        combined["prev_close"] = combined["actual"].shift(1)
+        combined["pred_return"] = combined["predicted"] / combined["prev_close"] - 1.0
+        combined = combined.dropna(subset=["prev_close", "pred_return"])
 
-        # 过滤信号：避免频繁交易
-        combined['position'] = combined['signal'].replace(to_replace=0, method='ffill').fillna(0)
-
+        short_signal = -1 if self.allow_short else 0
+        combined["signal"] = np.where(
+            combined["pred_return"] > threshold,
+            1,
+            np.where(combined["pred_return"] < -threshold, short_signal, 0),
+        )
+        combined["position"] = combined["signal"].astype(int)
         return combined
 
     def run_backtest(self, combined_df):
-        """
-        运行回测
-        """
-        # 初始化资金和持仓
-        capital = self.initial_capital
-        position = 0
+        """Run the strategy through the shared paper broker execution path."""
+        required_cols = {"symbol", "open", "actual", "volume", "position"}
+        missing = required_cols - set(combined_df.columns)
+        if missing:
+            raise ValueError(f"combined_df is missing required columns: {sorted(missing)}")
+
+        risk_manager = PaperRiskManager(
+            initial_equity=self.initial_capital,
+            max_drawdown=self.max_drawdown_stop,
+            min_cash_fraction=self.min_cash_fraction,
+        )
+        broker = PaperBroker(
+            initial_cash=self.initial_capital,
+            commission_rate=self.commission_rate,
+            slippage_rate=self.slippage_rate,
+            max_participation_rate=self.max_participation_rate,
+            risk_manager=risk_manager,
+        )
         trades = []
+        results = []
 
-        # 回测记录
-        backtest_results = pd.DataFrame(index=combined_df.index)
-        backtest_results['capital'] = capital
-        backtest_results['position'] = 0
-        backtest_results['returns'] = 0.0
-        backtest_results['price'] = combined_df['actual'].combine_first(combined_df['predicted'])
+        for date, row in combined_df.iterrows():
+            symbol = str(row["symbol"])
+            open_price = float(row["open"])
+            close_price = float(row["actual"])
+            volume = float(row["volume"])
+            signal = int(row["position"])
 
-        for i, (date, row) in enumerate(combined_df.iterrows()):
-            current_price = row['actual'] if not pd.isna(row['actual']) else row['predicted']
-            signal = row['position']
-
-            # 跳过无效价格
-            if pd.isna(current_price):
+            if (
+                not np.isfinite(open_price)
+                or not np.isfinite(close_price)
+                or not np.isfinite(volume)
+                or open_price <= 0
+                or close_price <= 0
+                or volume < 0
+            ):
                 continue
 
-            # 执行交易
-            if i > 0:  # 从第二天开始
-                prev_position = backtest_results['position'].iloc[i - 1] if i > 0 else 0
+            reference_open = {symbol: open_price}
+            equity_at_open = broker.equity(reference_open)
+            if equity_at_open <= 0:
+                raise ValueError("Portfolio equity became non-positive.")
 
-                # 平仓信号
-                if prev_position != 0 and signal == 0:
-                    # 平仓
-                    capital = position * current_price
-                    position = 0
-                    trades.append({
-                        'date': date,
-                        'action': 'SELL',
-                        'price': current_price,
-                        'shares': prev_position,
-                        'capital': capital
-                    })
+            risk_manager.update(equity_at_open)
+            if risk_manager.halted:
+                signal = 0
 
-                # 开仓信号
-                elif prev_position == 0 and signal != 0:
-                    # 计算可买股数（假设全仓交易）
-                    shares = int(capital / current_price)
-                    if shares > 0:
-                        position = shares * signal
-                        capital -= shares * current_price
-                        trades.append({
-                            'date': date,
-                            'action': 'BUY',
-                            'price': current_price,
-                            'shares': shares * signal,
-                            'capital': capital
-                        })
+            current_position = broker.positions.get(symbol)
+            current_shares = current_position.quantity if current_position else 0
+            broker.cancel_open_orders(symbol=symbol, reason="replaced by latest target")
+            if signal > 0:
+                target_notional = max(0.0, equity_at_open * self.max_position_fraction)
+                estimated_buy_price = open_price * (1 + self.slippage_rate)
+                target_shares = int(target_notional / (estimated_buy_price * (1 + self.commission_rate)))
+            else:
+                target_shares = 0
 
-            # 更新持仓市值
-            portfolio_value = capital + position * current_price
+            delta = target_shares - current_shares
+            if delta > 0:
+                broker.submit_order(symbol, BUY, delta, date, reference_prices=reference_open)
+            elif delta < 0:
+                broker.submit_order(symbol, SELL, abs(delta), date, reference_prices=reference_open)
 
-            # 记录结果
-            backtest_results.loc[date, 'capital'] = portfolio_value
-            backtest_results.loc[date, 'position'] = position
-            backtest_results.loc[date, 'price'] = current_price
+            bar = MarketBar(
+                symbol=symbol,
+                timestamp=pd.Timestamp(date),
+                open=open_price,
+                high=max(open_price, close_price),
+                low=min(open_price, close_price),
+                close=close_price,
+                volume=volume,
+            )
+            fills = broker.process_bar(bar, reference_prices=reference_open)
+            for fill in fills:
+                trades.append(
+                    {
+                        "date": fill.timestamp,
+                        "action": fill.side,
+                        "price": fill.price,
+                        "shares": fill.quantity,
+                        "commission": fill.commission,
+                        "cash": broker.cash,
+                        "order_id": fill.order_id,
+                        "target_position": target_shares,
+                    }
+                )
 
-            # 计算日收益率
-            if i > 0:
-                prev_value = backtest_results['capital'].iloc[i - 1]
-                if prev_value > 0:
-                    backtest_results.loc[date, 'returns'] = (portfolio_value - prev_value) / prev_value
+            portfolio_value = broker.equity({symbol: close_price})
+            risk_manager.update(portfolio_value)
+            position = broker.positions.get(symbol)
+            results.append(
+                {
+                    "date": date,
+                    "capital": portfolio_value,
+                    "cash": broker.cash,
+                    "position": position.quantity if position else 0,
+                    "price": close_price,
+                    "trading_halted": risk_manager.halted,
+                }
+            )
 
+        if not results:
+            raise ValueError("Backtest produced no valid rows.")
+
+        backtest_results = pd.DataFrame(results).set_index("date")
+        backtest_results["returns"] = backtest_results["capital"].pct_change().fillna(0.0)
         return backtest_results, trades
 
     def calculate_metrics(self, backtest_results, trades):
-        """
-        计算回测指标
-        """
-        returns = backtest_results['returns'].replace([np.inf, -np.inf], np.nan).dropna()
-
-        if len(returns) == 0:
-            return {
-                '总收益率': 0,
-                '年化收益率': 0,
-                '波动率': 0,
-                '夏普比率': 0,
-                '最大回撤': 0,
-                '胜率': 0,
-                '平均交易收益': 0,
-                '交易次数': 0,
-                '最终资金': self.initial_capital
-            }
-
-        total_return = (backtest_results['capital'].iloc[-1] - self.initial_capital) / self.initial_capital
-        annual_return = (1 + total_return) ** (252 / len(returns)) - 1
-
-        # 波动率
-        volatility = returns.std() * np.sqrt(252)
-
-        # 夏普比率（假设无风险利率为3%）
+        returns = backtest_results["returns"].replace([np.inf, -np.inf], np.nan).dropna()
+        total_return = (backtest_results["capital"].iloc[-1] - self.initial_capital) / self.initial_capital
+        annual_return = (1 + total_return) ** (252 / max(len(returns), 1)) - 1
+        volatility = returns.std() * np.sqrt(252) if len(returns) > 1 else 0.0
         risk_free_rate = 0.03
-        sharpe_ratio = (annual_return - risk_free_rate) / volatility if volatility > 0 else 0
+        sharpe_ratio = (annual_return - risk_free_rate) / volatility if volatility > 0 else 0.0
 
-        # 最大回撤
-        cumulative_returns = (1 + returns).cumprod()
-        peak = cumulative_returns.expanding().max()
-        drawdown = (cumulative_returns - peak) / peak
-        max_drawdown = drawdown.min()
+        equity_curve = backtest_results["capital"] / self.initial_capital
+        peak = equity_curve.expanding().max()
+        max_drawdown = ((equity_curve - peak) / peak).min()
 
-        # 交易统计
-        trade_returns = []
-        buy_trades = [t for t in trades if t['action'] == 'BUY']
-        sell_trades = [t for t in trades if t['action'] == 'SELL']
+        closed_trade_returns = []
+        entry_price = None
+        for trade in trades:
+            if trade["action"] == "BUY" and entry_price is None:
+                entry_price = trade["price"]
+            elif trade["action"] == "SELL" and entry_price:
+                closed_trade_returns.append((trade["price"] - entry_price) / entry_price)
+                entry_price = None
 
-        for i in range(min(len(buy_trades), len(sell_trades))):
-            buy = buy_trades[i]
-            sell = sell_trades[i]
-            trade_return = (sell['price'] - buy['price']) / buy['price']
-            trade_returns.append(trade_return)
+        win_rate = (
+            len([ret for ret in closed_trade_returns if ret > 0]) / len(closed_trade_returns)
+            if closed_trade_returns
+            else 0.0
+        )
+        avg_trade_return = float(np.mean(closed_trade_returns)) if closed_trade_returns else 0.0
 
-        win_rate = len([r for r in trade_returns if r > 0]) / len(trade_returns) if trade_returns else 0
-        avg_trade_return = np.mean(trade_returns) if trade_returns else 0
-
-        metrics = {
-            '总收益率': total_return,
-            '年化收益率': annual_return,
-            '波动率': volatility,
-            '夏普比率': sharpe_ratio,
-            '最大回撤': max_drawdown,
-            '胜率': win_rate,
-            '平均交易收益': avg_trade_return,
-            '交易次数': len(trades),
-            '最终资金': backtest_results['capital'].iloc[-1]
+        return {
+            "total_return": total_return,
+            "annual_return": annual_return,
+            "volatility": volatility,
+            "sharpe_ratio": sharpe_ratio,
+            "max_drawdown": max_drawdown,
+            "win_rate": win_rate,
+            "avg_trade_return": avg_trade_return,
+            "trade_count": len(trades),
+            "final_capital": backtest_results["capital"].iloc[-1],
         }
 
-        return metrics
-
     def plot_backtest_results(self, backtest_results, metrics, stock_code, output_dir):
-        """
-        绘制回测结果图表
-        """
+        import matplotlib.pyplot as plt
+
+        plt.rcParams["font.sans-serif"] = ["SimHei"]
+        plt.rcParams["axes.unicode_minus"] = False
+
         fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 12))
 
-        # 1. 资金曲线
-        ax1.plot(backtest_results.index, backtest_results['capital'],
-                 linewidth=2, label='策略资金曲线', color='#1f77b4')
-        ax1.axhline(y=self.initial_capital, color='red', linestyle='--',
-                    label=f'初始资金 ({self.initial_capital:,.0f}元)')
-        ax1.set_ylabel('资金 (元)', fontsize=12)
+        ax1.plot(backtest_results.index, backtest_results["capital"], linewidth=2, label="Strategy equity")
+        ax1.axhline(y=self.initial_capital, color="red", linestyle="--", label="Initial capital")
+        ax1.set_ylabel("Capital")
         ax1.legend()
         ax1.grid(True, alpha=0.3)
-        ax1.set_title(f'{stock_code} Kronos模型回测结果', fontsize=14, fontweight='bold')
+        ax1.set_title(f"{stock_code} Kronos historical backtest")
 
-        # 2. 收益率曲线
-        cumulative_returns = (1 + backtest_results['returns'].fillna(0)).cumprod()
-        ax2.plot(backtest_results.index, cumulative_returns,
-                 linewidth=2, label='策略累计收益', color='#2ca02c')
-
-        # 基准收益（买入持有）
-        price_returns = backtest_results['price'].pct_change().fillna(0)
-        benchmark_returns = (1 + price_returns).cumprod()
-        ax2.plot(backtest_results.index, benchmark_returns,
-                 linewidth=2, label='基准收益（买入持有）', color='#ff7f0e', alpha=0.7)
-
-        ax2.set_ylabel('累计收益', fontsize=12)
+        cumulative_returns = (1 + backtest_results["returns"].fillna(0)).cumprod()
+        ax2.plot(backtest_results.index, cumulative_returns, linewidth=2, label="Strategy return")
+        benchmark_returns = (1 + backtest_results["price"].pct_change().fillna(0)).cumprod()
+        ax2.plot(backtest_results.index, benchmark_returns, linewidth=2, label="Buy and hold", alpha=0.7)
+        ax2.set_ylabel("Cumulative return")
         ax2.legend()
         ax2.grid(True, alpha=0.3)
 
-        # 3. 回撤曲线
         peak = cumulative_returns.expanding().max()
         drawdown = (cumulative_returns - peak) / peak
-        ax3.fill_between(backtest_results.index, drawdown, 0,
-                         alpha=0.3, color='red', label='回撤')
-        ax3.set_ylabel('回撤', fontsize=12)
-        ax3.set_xlabel('日期', fontsize=12)
+        ax3.fill_between(backtest_results.index, drawdown, 0, alpha=0.3, color="red", label="Drawdown")
+        ax3.set_ylabel("Drawdown")
+        ax3.set_xlabel("Date")
         ax3.legend()
         ax3.grid(True, alpha=0.3)
 
-        # 添加指标文本
         metrics_text = (
-            f"总收益率: {metrics['总收益率']:.2%}\n"
-            f"年化收益率: {metrics['年化收益率']:.2%}\n"
-            f"夏普比率: {metrics['夏普比率']:.2f}\n"
-            f"最大回撤: {metrics['最大回撤']:.2%}\n"
-            f"胜率: {metrics['胜率']:.2%}\n"
-            f"交易次数: {metrics['交易次数']}\n"
-            f"最终资金: {metrics['最终资金']:,.0f}元"
+            f"Total return: {metrics['total_return']:.2%}\n"
+            f"Annual return: {metrics['annual_return']:.2%}\n"
+            f"Sharpe: {metrics['sharpe_ratio']:.2f}\n"
+            f"Max drawdown: {metrics['max_drawdown']:.2%}\n"
+            f"Win rate: {metrics['win_rate']:.2%}\n"
+            f"Trades: {metrics['trade_count']}\n"
+            f"Final capital: {metrics['final_capital']:,.0f}"
+        )
+        ax1.text(
+            0.02,
+            0.98,
+            metrics_text,
+            transform=ax1.transAxes,
+            fontsize=10,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8),
         )
 
-        ax1.text(0.02, 0.98, metrics_text, transform=ax1.transAxes, fontsize=10,
-                 verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3",
-                                                    facecolor="lightyellow", alpha=0.8))
-
         plt.tight_layout()
-
-        # 保存图表
         os.makedirs(output_dir, exist_ok=True)
-        chart_file = os.path.join(output_dir, f'{stock_code}_backtest_results.png')
-        plt.savefig(chart_file, dpi=300, bbox_inches='tight')
-        print(f"📊 回测图表已保存: {chart_file}")
-
+        chart_file = os.path.join(output_dir, f"{stock_code}_backtest_results.png")
+        plt.savefig(chart_file, dpi=300, bbox_inches="tight")
+        print(f"Backtest chart saved: {chart_file}")
         plt.show()
 
-    def run_complete_backtest(self, stock_code, output_dir, threshold=0.02):
-        """
-        运行完整的回测流程
-        """
-        print(f"🎯 开始 {stock_code} 回测分析")
+    def run_complete_backtest(self, stock_code, output_dir, threshold=0.02, raise_on_error=True):
+        print(f"Starting historical backtest for {stock_code}")
         print("=" * 50)
 
         try:
-            # 1. 加载数据
-            print("步骤1: 加载历史数据和预测数据...")
             hist_df = self.load_historical_data(stock_code)
             pred_df = self.load_predictions(stock_code)
-
-            # 2. 计算交易信号
-            print("步骤2: 计算交易信号...")
             combined_df = self.calculate_trading_signals(hist_df, pred_df, threshold)
-
-            # 3. 运行回测
-            print("步骤3: 运行回测...")
             backtest_results, trades = self.run_backtest(combined_df)
-
-            # 4. 计算指标
-            print("步骤4: 计算回测指标...")
             metrics = self.calculate_metrics(backtest_results, trades)
-
-            # 5. 绘制结果
-            print("步骤5: 生成回测图表...")
             self.plot_backtest_results(backtest_results, metrics, stock_code, output_dir)
 
-            # 6. 打印详细报告
             print("\n" + "=" * 70)
-            print(f"📊 {stock_code} 回测报告")
+            print(f"{stock_code} backtest report")
             print("=" * 70)
             for key, value in metrics.items():
                 if isinstance(value, float):
-                    if '率' in key or '收益' in key or '回撤' in key:
-                        print(f"  {key}: {value:.2%}")
-                    else:
-                        print(f"  {key}: {value:.2f}")
+                    print(f"  {key}: {value:.4f}")
                 else:
                     print(f"  {key}: {value}")
 
-            print(f"\n交易记录 (共{len(trades)}次交易):")
-            for i, trade in enumerate(trades[-10:], 1):  # 显示最后10次交易
-                print(f"  交易{i}: {trade['date'].strftime('%Y-%m-%d')} "
-                      f"{trade['action']} {abs(trade['shares'])}股 @ {trade['price']:.2f}元")
+            print(f"\nTrades ({len(trades)} total):")
+            for i, trade in enumerate(trades[-10:], 1):
+                print(
+                    f"  {i}: {trade['date'].strftime('%Y-%m-%d')} "
+                    f"{trade['action']} {trade['shares']} shares @ {trade['price']:.2f}"
+                )
 
             return metrics, backtest_results, trades
-
-        except Exception as e:
-            print(f"❌ 回测过程中出现错误: {e}")
+        except Exception as exc:
+            if raise_on_error:
+                raise
+            print(f"Backtest failed: {exc}")
             import traceback
+
             traceback.print_exc()
             return None, None, None
 
 
 def main():
-    """
-    主函数：运行Kronos模型回测
-    """
-    # 配置参数
-    BACKTEST_CONFIG = {
-        "stock_code": "000831",  # 要回测的股票代码
-        "data_dir": r"D:\lianghuajiaoyi\Kronos\examples\data",  # 历史数据目录
-        "model_dir": r"D:\lianghuajiaoyi\Kronos\examples\yuce",  # 模型预测结果目录
-        "output_dir": r"D:\lianghuajiaoyi\Kronos\examples\backtest",  # 回测结果输出目录
-        "initial_capital": 100000,  # 初始资金
-        "threshold": 0.02  # 交易阈值（2%）
+    backtest_config = {
+        "stock_code": "000831",
+        "data_dir": r"D:\lianghuajiaoyi\Kronos\examples\data",
+        "model_dir": r"D:\lianghuajiaoyi\Kronos\examples\yuce",
+        "output_dir": r"D:\lianghuajiaoyi\Kronos\examples\backtest",
+        "initial_capital": 100000,
+        "threshold": 0.02,
     }
 
-    print("🤖 Kronos模型回测系统")
+    print("Kronos historical backtest")
     print("=" * 50)
-    print(f"回测股票: {BACKTEST_CONFIG['stock_code']}")
-    print(f"初始资金: {BACKTEST_CONFIG['initial_capital']:,.0f}元")
-    print(f"交易阈值: {BACKTEST_CONFIG['threshold']:.1%}")
+    print(f"Stock code: {backtest_config['stock_code']}")
+    print(f"Initial capital: {backtest_config['initial_capital']:,.0f}")
+    print(f"Threshold: {backtest_config['threshold']:.1%}")
     print()
 
-    # 创建回测器并运行
     backtester = KronosBacktester(
-        data_dir=BACKTEST_CONFIG["data_dir"],
-        model_dir=BACKTEST_CONFIG["model_dir"],
-        initial_capital=BACKTEST_CONFIG["initial_capital"]
+        data_dir=backtest_config["data_dir"],
+        model_dir=backtest_config["model_dir"],
+        initial_capital=backtest_config["initial_capital"],
     )
-
-    metrics, results, trades = backtester.run_complete_backtest(
-        stock_code=BACKTEST_CONFIG["stock_code"],
-        output_dir=BACKTEST_CONFIG["output_dir"],
-        threshold=BACKTEST_CONFIG["threshold"]
+    metrics, _, _ = backtester.run_complete_backtest(
+        stock_code=backtest_config["stock_code"],
+        output_dir=backtest_config["output_dir"],
+        threshold=backtest_config["threshold"],
     )
 
     if metrics:
-        print(f"\n✅ {BACKTEST_CONFIG['stock_code']} 回测完成!")
-        print(f"📁 结果保存在: {BACKTEST_CONFIG['output_dir']}")
+        print(f"\nBacktest completed. Results saved to: {backtest_config['output_dir']}")
 
 
 if __name__ == "__main__":

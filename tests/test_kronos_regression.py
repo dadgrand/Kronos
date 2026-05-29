@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-import torch
+torch = pytest.importorskip("torch")
 from tqdm import tqdm
 
 from model import Kronos, KronosPredictor, KronosTokenizer
