@@ -6,11 +6,17 @@ import pytest
 from trading.validation import AlphaValidationReport, ModelApprovalRegistry
 
 
-def approval_metadata(tmp_path, registry):
+def approval_metadata(tmp_path, registry, predictions=None, actuals=None, model_hash="abc123"):
     prediction_file = tmp_path / "predictions.json"
     actuals_file = tmp_path / "actuals.json"
-    prediction_file.write_text(json.dumps({"prediction_results": []}), encoding="utf-8")
-    actuals_file.write_text(json.dumps({"actuals": []}), encoding="utf-8")
+    prediction_file.write_text(
+        json.dumps({"prediction_results": ModelApprovalRegistry._json_safe(predictions or [])}),
+        encoding="utf-8",
+    )
+    actuals_file.write_text(
+        json.dumps({"actuals": ModelApprovalRegistry._json_safe(actuals or [])}),
+        encoding="utf-8",
+    )
     return {
         "prediction_file_path": str(prediction_file),
         "prediction_file_checksum": ModelApprovalRegistry.file_checksum(prediction_file),
@@ -19,7 +25,7 @@ def approval_metadata(tmp_path, registry):
         "oos_start": "2024-01-01",
         "oos_end": "2024-01-31",
         "universe": ["AAA"],
-        "model_hash": "abc123",
+        "model_hash": model_hash,
         "model_revision": "model-rev",
         "tokenizer_revision": "tokenizer-rev",
         "code_version": registry.code_version,
@@ -264,17 +270,19 @@ def test_model_approval_registry_persists_only_accepted_reports(tmp_path):
         min_symbols=1,
         min_regimes=1,
     )
-    metadata = approval_metadata(tmp_path, registry)
+    predictions = [
+        prediction("AAA", "2024-01-01", "2024-01-02", 101.0),
+        prediction("AAA", "2024-01-02", "2024-01-03", 103.0),
+    ]
+    actuals = [
+        {"symbol": "AAA", "timestamp": "2024-01-01", "close": 100.0},
+        {"symbol": "AAA", "timestamp": "2024-01-02", "close": 101.0},
+        {"symbol": "AAA", "timestamp": "2024-01-03", "close": 103.0},
+    ]
+    metadata = approval_metadata(tmp_path, registry, predictions, actuals)
     report = AlphaValidationReport(
-        predictions=[
-            prediction("AAA", "2024-01-01", "2024-01-02", 101.0),
-            prediction("AAA", "2024-01-02", "2024-01-03", 103.0),
-        ],
-        actuals=[
-            {"symbol": "AAA", "timestamp": "2024-01-01", "close": 100.0},
-            {"symbol": "AAA", "timestamp": "2024-01-02", "close": 101.0},
-            {"symbol": "AAA", "timestamp": "2024-01-03", "close": 103.0},
-        ],
+        predictions=predictions,
+        actuals=actuals,
         min_net_excess_return=0.0,
         min_directional_accuracy=0.5,
         min_active_period_fraction=0.5,
@@ -322,10 +330,17 @@ def test_model_approval_registry_persists_only_accepted_reports(tmp_path):
     with pytest.raises(ValueError, match="accepted"):
         registry.approve("bad", bad_report, metadata=metadata)
 
+    forged_report = dict(report)
+    forged_report["strategy_net_return"] = float(report["strategy_net_return"]) + 0.01
+    with pytest.raises(ValueError, match="immutable prediction/actuals"):
+        registry.approve("abc123", forged_report, metadata=metadata)
+
     fake = {
         "accepted": True,
         "failed_criteria": [],
         "criteria": {
+            "long_threshold": 0.0,
+            "transaction_cost_bps": 0.0,
             "min_net_excess_return": 0.0,
             "min_directional_accuracy": 0.5,
             "min_active_period_fraction": 0.5,
@@ -393,17 +408,19 @@ def test_model_approval_registry_rejects_underpowered_report_by_default(tmp_path
         min_directional_accuracy=0.5,
         min_active_period_fraction=0.1,
     )
-    metadata = approval_metadata(tmp_path, registry)
+    predictions = [
+        prediction("AAA", "2024-01-01", "2024-01-02", 101.0),
+        prediction("AAA", "2024-01-02", "2024-01-03", 102.0),
+    ]
+    actuals = [
+        {"symbol": "AAA", "timestamp": "2024-01-01", "close": 100.0},
+        {"symbol": "AAA", "timestamp": "2024-01-02", "close": 101.0},
+        {"symbol": "AAA", "timestamp": "2024-01-03", "close": 102.0},
+    ]
+    metadata = approval_metadata(tmp_path, registry, predictions, actuals)
     report = AlphaValidationReport(
-        predictions=[
-            prediction("AAA", "2024-01-01", "2024-01-02", 101.0),
-            prediction("AAA", "2024-01-02", "2024-01-03", 102.0),
-        ],
-        actuals=[
-            {"symbol": "AAA", "timestamp": "2024-01-01", "close": 100.0},
-            {"symbol": "AAA", "timestamp": "2024-01-02", "close": 101.0},
-            {"symbol": "AAA", "timestamp": "2024-01-03", "close": 102.0},
-        ],
+        predictions=predictions,
+        actuals=actuals,
         min_net_excess_return=0.0,
         min_directional_accuracy=0.5,
         min_active_period_fraction=0.1,

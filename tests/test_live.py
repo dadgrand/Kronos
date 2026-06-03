@@ -347,71 +347,33 @@ def test_live_execution_loop_gates_submit_with_reconciliation(tmp_path):
     loop = LiveExecutionLoop(adapter, journal=JsonlOrderJournal(tmp_path / "live.jsonl"))
     request = LiveOrderRequest(symbol="AAA", side="BUY", quantity="1", client_order_id="client-1")
 
-    def record_local_ack(acknowledgement):
-        broker.orders[acknowledgement.client_order_id] = Order(
-            symbol=acknowledgement.symbol,
-            side=acknowledgement.side,
-            quantity=acknowledgement.quantity,
-            submitted_at=acknowledgement.submitted_at,
-            id=acknowledgement.client_order_id,
-        )
-
-    acknowledgement = loop.submit_order(broker, request, on_ack=record_local_ack)
+    acknowledgement = loop.submit_order(broker, request)
 
     assert acknowledgement.client_order_id == "client-1"
     assert adapter.submitted == [request]
+    assert "client-1" in broker.orders
 
 
-def test_live_execution_loop_requires_local_state_transition_before_post_reconcile(tmp_path):
+def test_live_execution_loop_rejects_custom_submit_ack_hook(tmp_path):
     broker = PaperBroker(initial_cash=10000, commission_rate=0.0, slippage_rate=0.0)
     adapter = FakeBrokerAdapter(cash=10000)
+    loop = LiveExecutionLoop(adapter, journal=JsonlOrderJournal(tmp_path / "live.jsonl"))
+    request = LiveOrderRequest(symbol="AAA", side="BUY", quantity="1", client_order_id="client-1")
+
+    with pytest.raises(ValueError, match="Custom on_ack"):
+        loop.submit_order(broker, request, on_ack=lambda _ack: None)
+
+    assert adapter.submitted == []
+
+
+def test_live_execution_loop_submit_rolls_back_on_failed_post_reconcile(tmp_path):
+    broker = PaperBroker(initial_cash=10000, commission_rate=0.0, slippage_rate=0.0)
+    adapter = NonPersistingSubmitAdapter(cash=10000)
     loop = LiveExecutionLoop(adapter, journal=JsonlOrderJournal(tmp_path / "live.jsonl"))
     request = LiveOrderRequest(symbol="AAA", side="BUY", quantity="1", client_order_id="client-1")
 
     with pytest.raises(LiveReconciliationError, match="post_submit"):
         loop.submit_order(broker, request)
-
-
-def test_live_execution_loop_submit_rolls_back_on_ack_exception(tmp_path):
-    broker = PaperBroker(initial_cash=10000, commission_rate=0.0, slippage_rate=0.0)
-    adapter = FakeBrokerAdapter(cash=10000)
-    loop = LiveExecutionLoop(adapter, journal=JsonlOrderJournal(tmp_path / "live.jsonl"))
-    request = LiveOrderRequest(symbol="AAA", side="BUY", quantity="1", client_order_id="client-1")
-
-    def broken_ack(acknowledgement):
-        broker.orders[acknowledgement.client_order_id] = Order(
-            acknowledgement.symbol,
-            acknowledgement.side,
-            acknowledgement.quantity,
-            acknowledgement.submitted_at,
-            id=acknowledgement.client_order_id,
-        )
-        raise RuntimeError("local transition failed")
-
-    with pytest.raises(RuntimeError, match="local transition failed"):
-        loop.submit_order(broker, request, on_ack=broken_ack)
-
-    assert broker.orders == {}
-    assert any(record["event_type"] == "live_order_transition_error" for record in loop.journal.read_all())
-
-
-def test_live_execution_loop_submit_rolls_back_on_failed_post_reconcile(tmp_path):
-    broker = PaperBroker(initial_cash=10000, commission_rate=0.0, slippage_rate=0.0)
-    adapter = FakeBrokerAdapter(cash=10000)
-    loop = LiveExecutionLoop(adapter, journal=JsonlOrderJournal(tmp_path / "live.jsonl"))
-    request = LiveOrderRequest(symbol="AAA", side="BUY", quantity="1", client_order_id="client-1")
-
-    def wrong_local_ack(acknowledgement):
-        broker.orders[acknowledgement.client_order_id] = Order(
-            acknowledgement.symbol,
-            acknowledgement.side,
-            2,
-            acknowledgement.submitted_at,
-            id=acknowledgement.client_order_id,
-        )
-
-    with pytest.raises(LiveReconciliationError, match="post_submit"):
-        loop.submit_order(broker, request, on_ack=wrong_local_ack)
 
     assert broker.orders == {}
     assert any(record["event_type"] == "live_order_transition_error" for record in loop.journal.read_all())
@@ -419,18 +381,14 @@ def test_live_execution_loop_submit_rolls_back_on_failed_post_reconcile(tmp_path
 
 def test_live_execution_loop_journals_intent_ack_and_transition_error(tmp_path):
     broker = PaperBroker(initial_cash=10000, commission_rate=0.0, slippage_rate=0.0)
-    adapter = FakeBrokerAdapter(cash=10000)
+    adapter = NonPersistingSubmitAdapter(cash=10000)
     journal = JsonlOrderJournal(tmp_path / "live.jsonl")
     loop = LiveExecutionLoop(adapter, journal=journal)
     request = LiveOrderRequest(symbol="AAA", side="BUY", quantity="1", client_order_id="client-1")
 
-    def broken_local_transition(_acknowledgement):
-        raise RuntimeError("local disk unavailable")
+    with pytest.raises(LiveReconciliationError, match="post_submit"):
+        loop.submit_order(broker, request)
 
-    with pytest.raises(RuntimeError, match="local disk unavailable"):
-        loop.submit_order(broker, request, on_ack=broken_local_transition)
-
-    assert adapter.orders
     assert broker.orders == {}
     event_types = [record["event_type"] for record in journal.read_all()]
     assert "live_order_intent" in event_types
@@ -444,27 +402,19 @@ def test_live_execution_loop_runs_local_transition_even_if_ack_journal_fails():
     loop = LiveExecutionLoop(adapter, journal=FailingAckJournal())
     request = LiveOrderRequest(symbol="AAA", side="BUY", quantity="1", client_order_id="client-1")
 
-    def record_local_ack(acknowledgement):
-        broker.orders[acknowledgement.client_order_id] = Order(
-            symbol=acknowledgement.symbol,
-            side=acknowledgement.side,
-            quantity=acknowledgement.quantity,
-            submitted_at=acknowledgement.submitted_at,
-            id=acknowledgement.client_order_id,
-        )
-
     with pytest.raises(OSError, match="disk full"):
-        loop.submit_order(broker, request, on_ack=record_local_ack)
+        loop.submit_order(broker, request)
 
-    assert "client-1" in broker.orders
+    assert broker.orders == {}
     assert adapter.orders
-    retry_ack = loop.submit_order(broker, request, on_ack=record_local_ack)
+    retry_ack = loop.submit_order(broker, request)
     assert retry_ack.external_id == "broker-ack"
+    assert "client-1" in broker.orders
     assert adapter.submitted == [request]
 
     conflicting = LiveOrderRequest(symbol="BBB", side="BUY", quantity="2", client_order_id="client-1")
     with pytest.raises(ValueError, match="idempotency_conflict"):
-        loop.submit_order(broker, conflicting, on_ack=record_local_ack)
+        loop.submit_order(broker, conflicting)
 
     conflicting_contract = LiveOrderRequest(
         symbol="AAA",
@@ -475,7 +425,88 @@ def test_live_execution_loop_runs_local_transition_even_if_ack_journal_fails():
         limit_price="99",
     )
     with pytest.raises(ValueError, match="idempotency_conflict"):
-        loop.submit_order(broker, conflicting_contract, on_ack=record_local_ack)
+        loop.submit_order(broker, conflicting_contract)
+
+
+@pytest.mark.parametrize(
+    ("ack_status", "fill_quantity", "expected_status", "expected_external_orders"),
+    [
+        ("FILLED", Decimal("1"), "FILLED", 0),
+        ("PARTIALLY_FILLED", Decimal("0.4"), "PARTIALLY_FILLED", 1),
+    ],
+)
+def test_live_execution_loop_applies_immediate_ack_fill_from_fill_stream(
+    tmp_path,
+    ack_status,
+    fill_quantity,
+    expected_status,
+    expected_external_orders,
+):
+    broker = PaperBroker(initial_cash=10000, commission_rate=0.0, slippage_rate=0.0)
+    adapter = ImmediateFillAckAdapter(status=ack_status, fill_quantity=fill_quantity, publish_fill=True)
+    loop = LiveExecutionLoop(adapter, journal=JsonlOrderJournal(tmp_path / "live.jsonl"))
+    request = LiveOrderRequest(symbol="AAA", side="BUY", quantity="1", client_order_id="client-1")
+
+    acknowledgement = loop.submit_order(broker, request)
+
+    assert acknowledgement.status == ack_status
+    assert broker.orders["client-1"].status == expected_status
+    assert broker.orders["client-1"].filled_quantity == fill_quantity
+    assert broker.positions["AAA"].quantity == fill_quantity
+    assert broker.cash == Decimal("10000.0") - fill_quantity * Decimal("10")
+    assert len(adapter.orders) == expected_external_orders
+    assert not any(record["event_type"] == "live_fill_rejected" for record in loop.journal.read_all())
+
+
+def test_live_execution_loop_rejects_immediate_ack_without_fill_stream(tmp_path):
+    broker = PaperBroker(initial_cash=10000, commission_rate=0.0, slippage_rate=0.0)
+    adapter = ImmediateFillAckAdapter(status="FILLED", fill_quantity=Decimal("1"), publish_fill=False)
+    loop = LiveExecutionLoop(adapter, journal=JsonlOrderJournal(tmp_path / "live.jsonl"))
+    request = LiveOrderRequest(symbol="AAA", side="BUY", quantity="1", client_order_id="client-1")
+
+    with pytest.raises(LiveReconciliationError, match="post_submit"):
+        loop.submit_order(broker, request)
+
+    assert broker.orders == {}
+    assert any(record["event_type"] == "live_order_transition_error" for record in loop.journal.read_all())
+
+
+def test_live_execution_loop_reconciles_deduplicated_submit(tmp_path):
+    broker = PaperBroker(initial_cash=10000, commission_rate=0.0, slippage_rate=0.0)
+    broker.orders["client-1"] = Order("AAA", "BUY", 1, pd.Timestamp("2024-01-01"), id="client-1")
+    adapter = FakeBrokerAdapter(cash=9000)
+    adapter.orders.append(
+        ExternalOrder(
+            external_id="broker-ack",
+            client_order_id="client-1",
+            symbol="AAA",
+            side="BUY",
+            quantity=1,
+            filled_quantity=0,
+            status="ACCEPTED",
+            submitted_at=pd.Timestamp("2024-01-01"),
+        )
+    )
+    loop = LiveExecutionLoop(adapter, journal=JsonlOrderJournal(tmp_path / "live.jsonl"))
+    request = LiveOrderRequest(symbol="AAA", side="BUY", quantity="1", client_order_id="client-1")
+
+    with pytest.raises(LiveReconciliationError, match="post_submit_deduplicated"):
+        loop.submit_order(broker, request)
+
+    assert adapter.submitted == []
+
+
+def test_live_execution_loop_replays_order_ack_from_journal_before_reconcile(tmp_path):
+    journal = JsonlOrderJournal(tmp_path / "live.jsonl")
+    broker = PaperBroker(initial_cash=10000, commission_rate=0.0, slippage_rate=0.0)
+    adapter = FakeBrokerAdapter(cash=10000)
+    request = LiveOrderRequest(symbol="AAA", side="BUY", quantity="1", client_order_id="client-1")
+    LiveExecutionLoop(adapter, journal=journal).submit_order(broker, request)
+
+    restored = PaperBroker(initial_cash=10000, commission_rate=0.0, slippage_rate=0.0)
+    LiveExecutionLoop(adapter, journal=journal).preflight(restored)
+
+    assert restored.orders["client-1"].status == "OPEN"
 
 
 def test_live_execution_loop_recovery_returns_reconciliation_report(tmp_path):
@@ -491,23 +522,20 @@ def test_live_execution_loop_recovery_returns_reconciliation_report(tmp_path):
     assert any(record["event_type"] == "live_recovery_reconcile" for record in journal.read_all())
 
 
-def test_live_execution_loop_cancel_dedup_updates_local_state_when_external_absent(tmp_path):
+def test_live_execution_loop_cancel_dedup_reconciles_when_external_absent_without_evidence(tmp_path):
     broker = PaperBroker(initial_cash=10000, commission_rate=0.0, slippage_rate=0.0)
     broker.orders["client-1"] = Order("AAA", "BUY", 1, pd.Timestamp("2024-01-01"), id="client-1")
     adapter = FakeBrokerAdapter(cash=10000)
     loop = LiveExecutionLoop(adapter, journal=JsonlOrderJournal(tmp_path / "live.jsonl"))
 
-    def mark_cancelled(_ack):
-        broker.orders["client-1"].status = CANCELLED
+    with pytest.raises(LiveReconciliationError, match="post_cancel_deduplicated"):
+        loop.cancel_order(broker, "already-gone")
 
-    result = loop.cancel_order(broker, "already-gone", on_ack=mark_cancelled)
-
-    assert result["status"] == "already_absent"
     assert adapter.cancelled == []
-    assert broker.orders["client-1"].status == CANCELLED
+    assert broker.orders["client-1"].status == "OPEN"
 
 
-def test_live_execution_loop_cancel_dedup_rolls_back_failed_transition(tmp_path):
+def test_live_execution_loop_cancel_dedup_does_not_mutate_when_external_id_absent(tmp_path):
     broker = PaperBroker(initial_cash=10000, commission_rate=0.0, slippage_rate=0.0)
     broker.orders["client-1"] = Order("AAA", "BUY", 1, pd.Timestamp("2024-01-01"), id="client-1")
     adapter = FakeBrokerAdapter(cash=10000)
@@ -525,37 +553,29 @@ def test_live_execution_loop_cancel_dedup_rolls_back_failed_transition(tmp_path)
     )
     loop = LiveExecutionLoop(adapter, journal=JsonlOrderJournal(tmp_path / "live.jsonl"))
 
-    def wrongly_mark_cancelled(_ack):
-        broker.orders["client-1"].status = CANCELLED
+    result = loop.cancel_order(broker, "wrong-external-id")
 
-    with pytest.raises(LiveReconciliationError, match="post_cancel_deduplicated"):
-        loop.cancel_order(broker, "wrong-external-id", on_ack=wrongly_mark_cancelled)
-
+    assert result["status"] == "already_absent"
     assert broker.orders["client-1"].status == "OPEN"
-    assert any(record["event_type"] == "live_cancel_transition_error" for record in loop.journal.read_all())
+    assert adapter.cancelled == []
 
 
-def test_live_execution_loop_cancel_dedup_rolls_back_on_ack_exception(tmp_path):
+def test_live_execution_loop_rejects_custom_cancel_ack_hook(tmp_path):
     broker = PaperBroker(initial_cash=10000, commission_rate=0.0, slippage_rate=0.0)
     broker.orders["client-1"] = Order("AAA", "BUY", 1, pd.Timestamp("2024-01-01"), id="client-1")
     adapter = FakeBrokerAdapter(cash=10000)
     loop = LiveExecutionLoop(adapter, journal=JsonlOrderJournal(tmp_path / "live.jsonl"))
 
-    def broken_ack(_ack):
-        broker.orders["client-1"].status = CANCELLED
-        raise RuntimeError("local transition failed")
-
-    with pytest.raises(RuntimeError, match="local transition failed"):
-        loop.cancel_order(broker, "already-gone", on_ack=broken_ack)
+    with pytest.raises(ValueError, match="Custom on_ack"):
+        loop.cancel_order(broker, "already-gone", on_ack=lambda _ack: None)
 
     assert broker.orders["client-1"].status == "OPEN"
-    assert any(record["event_type"] == "live_cancel_transition_error" for record in loop.journal.read_all())
 
 
 def test_live_execution_loop_normal_cancel_rolls_back_on_failed_post_reconcile(tmp_path):
     broker = PaperBroker(initial_cash=10000, commission_rate=0.0, slippage_rate=0.0)
     broker.orders["client-1"] = Order("AAA", "BUY", 1, pd.Timestamp("2024-01-01"), id="client-1")
-    adapter = FakeBrokerAdapter(cash=10000)
+    adapter = StubbornCancelAdapter(cash=10000)
     adapter.orders.append(
         ExternalOrder(
             external_id="actual-open",
@@ -575,6 +595,64 @@ def test_live_execution_loop_normal_cancel_rolls_back_on_failed_post_reconcile(t
 
     assert broker.orders["client-1"].status == "OPEN"
     assert any(record["event_type"] == "live_cancel_transition_error" for record in loop.journal.read_all())
+
+
+def test_live_execution_loop_replays_cancel_ack_from_journal_before_reconcile(tmp_path):
+    journal = JsonlOrderJournal(tmp_path / "live.jsonl")
+    broker = PaperBroker(initial_cash=10000, commission_rate=0.0, slippage_rate=0.0)
+    broker.orders["client-1"] = Order("AAA", "BUY", 1, pd.Timestamp("2024-01-01"), id="client-1")
+    adapter = FakeBrokerAdapter(cash=10000)
+    adapter.orders.append(
+        ExternalOrder(
+            external_id="actual-open",
+            client_order_id="client-1",
+            symbol="AAA",
+            side="BUY",
+            quantity=1,
+            filled_quantity=0,
+            status="ACCEPTED",
+            submitted_at=pd.Timestamp("2024-01-01"),
+        )
+    )
+    LiveExecutionLoop(adapter, journal=journal).cancel_order(broker, "actual-open")
+
+    restored = PaperBroker(initial_cash=10000, commission_rate=0.0, slippage_rate=0.0)
+    restored.orders["client-1"] = Order("AAA", "BUY", 1, pd.Timestamp("2024-01-01"), id="client-1")
+    LiveExecutionLoop(adapter, journal=journal).preflight(restored)
+
+    assert restored.orders["client-1"].status == CANCELLED
+
+
+def test_live_execution_loop_recovers_absent_cancel_after_ack_journal_failure():
+    broker = PaperBroker(initial_cash=10000, commission_rate=0.0, slippage_rate=0.0)
+    broker.orders["client-1"] = Order("AAA", "BUY", 1, pd.Timestamp("2024-01-01"), id="client-1")
+    adapter = FakeBrokerAdapter(cash=10000)
+    adapter.orders.append(
+        ExternalOrder(
+            external_id="actual-open",
+            client_order_id="client-1",
+            symbol="AAA",
+            side="BUY",
+            quantity=1,
+            filled_quantity=0,
+            status="ACCEPTED",
+            submitted_at=pd.Timestamp("2024-01-01"),
+        )
+    )
+    journal = FailingCancelAckJournal()
+    loop = LiveExecutionLoop(adapter, journal=journal)
+
+    with pytest.raises(OSError, match="disk full"):
+        loop.cancel_order(broker, "actual-open")
+
+    assert adapter.orders == []
+    assert broker.orders["client-1"].status == "OPEN"
+
+    result = loop.cancel_order(broker, "actual-open")
+
+    assert result["recovered_local_cancel"] is True
+    assert broker.orders["client-1"].status == CANCELLED
+    assert any(record["event_type"] == "live_cancel_recovered" for record in journal.read_all())
 
 
 def test_live_execution_loop_recovery_suggests_cancel_for_local_closed_external_open(tmp_path):
@@ -938,6 +1016,66 @@ class FakeBrokerAdapter:
         return list(self.fills)
 
 
+class NonPersistingSubmitAdapter(FakeBrokerAdapter):
+    def submit_order(self, request):
+        self.submitted.append(request)
+        return ExternalOrder(
+            external_id="broker-ack",
+            client_order_id=request.client_order_id,
+            symbol=request.symbol,
+            side=request.side,
+            quantity=request.quantity,
+            filled_quantity=Decimal("0"),
+            status="ACCEPTED",
+            submitted_at=pd.Timestamp("2024-01-02"),
+            order_type=request.order_type,
+            time_in_force=request.time_in_force,
+            limit_price=request.limit_price,
+            stop_price=request.stop_price,
+            reduce_only=request.reduce_only,
+        )
+
+
+class StubbornCancelAdapter(FakeBrokerAdapter):
+    def cancel_order(self, external_id):
+        self.cancelled.append(external_id)
+        return {"external_id": external_id, "status": "cancel_requested"}
+
+
+class ImmediateFillAckAdapter(FakeBrokerAdapter):
+    def __init__(self, status, fill_quantity, publish_fill=True):
+        super().__init__(cash=Decimal("10000.0"))
+        self.status = status
+        self.fill_quantity = Decimal(fill_quantity)
+        self.publish_fill = publish_fill
+
+    def submit_order(self, request):
+        self.submitted.append(request)
+        self.cash = Decimal("10000.0") - self.fill_quantity * Decimal("10")
+        self.positions = {"AAA": self.fill_quantity}
+        acknowledgement = ExternalOrder(
+            external_id="broker-ack",
+            client_order_id=request.client_order_id,
+            symbol=request.symbol,
+            side=request.side,
+            quantity=request.quantity,
+            filled_quantity=self.fill_quantity,
+            status=self.status,
+            submitted_at=pd.Timestamp("2024-01-02"),
+            avg_fill_price=10.0,
+            order_type=request.order_type,
+            time_in_force=request.time_in_force,
+            limit_price=request.limit_price,
+            stop_price=request.stop_price,
+            reduce_only=request.reduce_only,
+        )
+        if self.status == "PARTIALLY_FILLED":
+            self.orders.append(acknowledgement)
+        if self.publish_fill:
+            self.fills.append(_external_fill("fill-1", request.client_order_id, quantity=str(self.fill_quantity)))
+        return acknowledgement
+
+
 class FailingAckJournal:
     def __init__(self):
         self.records = []
@@ -955,6 +1093,14 @@ class FailingAckJournal:
 class FailingFillAppliedJournal(FailingAckJournal):
     def append(self, event_type, payload):
         if event_type == "live_fill_applied":
+            raise OSError("disk full")
+        self.records.append({"event_type": event_type, "payload": payload})
+        return self.records[-1]
+
+
+class FailingCancelAckJournal(FailingAckJournal):
+    def append(self, event_type, payload):
+        if event_type == "live_cancel_ack":
             raise OSError("disk full")
         self.records.append({"event_type": event_type, "payload": payload})
         return self.records[-1]

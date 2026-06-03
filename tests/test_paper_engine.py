@@ -6,7 +6,7 @@ from trading.engine import PaperTradingEngine
 from trading.ops import FileKillSwitch, HeartbeatMonitor, JsonlOrderJournal
 from trading.paper import BUY, OPEN, MarketBar, Position
 from trading.runner import PaperTradingRunner, PredictionEvent
-from trading.validation import ModelApprovalRegistry
+from trading.validation import AlphaValidationReport, ModelApprovalRegistry
 
 
 def create_runner(**kwargs):
@@ -42,11 +42,17 @@ def make_prediction(timestamp, predicted_close=110.0, symbol="TEST"):
     )
 
 
-def approval_metadata(tmp_path, registry, model_hash="abc123"):
+def approval_metadata(tmp_path, registry, predictions=None, actuals=None, model_hash="abc123"):
     prediction_file = tmp_path / f"{model_hash}-predictions.json"
     actuals_file = tmp_path / f"{model_hash}-actuals.json"
-    prediction_file.write_text(json.dumps({"prediction_results": []}), encoding="utf-8")
-    actuals_file.write_text(json.dumps({"actuals": []}), encoding="utf-8")
+    prediction_file.write_text(
+        json.dumps({"prediction_results": ModelApprovalRegistry._json_safe(predictions or [])}),
+        encoding="utf-8",
+    )
+    actuals_file.write_text(
+        json.dumps({"actuals": ModelApprovalRegistry._json_safe(actuals or [])}),
+        encoding="utf-8",
+    )
     return {
         "prediction_file_path": str(prediction_file),
         "prediction_file_checksum": ModelApprovalRegistry.file_checksum(prediction_file),
@@ -61,6 +67,20 @@ def approval_metadata(tmp_path, registry, model_hash="abc123"):
         "code_version": registry.code_version,
         "code_manifest": registry.code_manifest,
         "validation_code_checksum": registry.validation_code_checksum,
+    }
+
+
+def prediction_to_json(prediction):
+    return {
+        "symbol": prediction.symbol,
+        "prediction_asof": prediction.prediction_asof.isoformat(),
+        "execution_timestamp": prediction.execution_timestamp.isoformat(),
+        "target_timestamp": prediction.target_timestamp.isoformat(),
+        "features_cutoff": prediction.features_cutoff.isoformat(),
+        "horizon": prediction.horizon,
+        "model_version": prediction.model_version,
+        "model_hash": prediction.model_hash,
+        "predicted_close": prediction.predicted_close,
     }
 
 
@@ -119,32 +139,25 @@ def test_engine_production_mode_rejects_permissive_registry_floors(tmp_path):
         min_symbols=1,
         min_regimes=1,
     )
+    predictions = [prediction_to_json(make_prediction("2024-01-02", predicted_close=101.0))]
+    actuals = [
+        {"symbol": "TEST", "timestamp": "2024-01-01", "close": 100.0},
+        {"symbol": "TEST", "timestamp": "2024-01-02", "close": 101.0},
+    ]
+    report = AlphaValidationReport(
+        predictions=predictions,
+        actuals=actuals,
+        min_net_excess_return=0.0,
+        min_directional_accuracy=0.5,
+        min_active_period_fraction=0.0,
+        min_observations=1,
+        min_symbols=1,
+        min_regimes=1,
+    ).compute()
     registry.approve(
         "abc123",
-        {
-            "accepted": True,
-            "failed_criteria": [],
-            "criteria": {
-                "min_net_excess_return": 0.0,
-                "min_directional_accuracy": 0.5,
-                "min_active_period_fraction": 0.0,
-                "min_observations": 1,
-                "min_symbols": 1,
-                "min_regimes": 1,
-            },
-            "observations": 1,
-            "symbols": 1,
-            "start": "2024-01-01",
-            "end": "2024-01-02",
-            "strategy_net_return": 0.0,
-            "baseline_return": 0.0,
-            "net_excess_return": 0.0,
-            "directional_accuracy": 1.0,
-            "active_period_fraction": 1.0,
-            "average_gross_exposure": 1.0,
-            "regime_metrics": [{"month": "2024-01"}],
-        },
-        metadata=approval_metadata(tmp_path, registry),
+        report,
+        metadata=approval_metadata(tmp_path, registry, predictions, actuals),
     )
     runner = PaperTradingRunner.create(initial_cash=10000, approval_registry=registry)
 

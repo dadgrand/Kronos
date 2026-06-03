@@ -14,7 +14,7 @@ from typing import Protocol
 
 import pandas as pd
 
-from .paper import FILLED, OPEN, PARTIALLY_FILLED, Position
+from .paper import CANCELLED, FILLED, OPEN, PARTIALLY_FILLED, Order, Position
 
 
 LIVE_OPEN_STATUSES = {OPEN, PARTIALLY_FILLED, "ACCEPTED", "PENDING", "NEW"}
@@ -454,29 +454,25 @@ class LiveExecutionLoop:
         return self._reconcile_or_raise(local_broker, "preflight")
 
     def submit_order(self, local_broker, request: LiveOrderRequest, on_ack=None):
-        self._reconcile_or_raise(local_broker, "pre_submit")
+        if on_ack is not None:
+            raise ValueError("Custom on_ack hooks are not allowed in durable live order submission.")
+        self.replay_order_acks(local_broker)
         existing = self._existing_external_order(request.client_order_id)
-        if existing is not None and request.client_order_id in local_broker.orders:
-            conflict = self._idempotency_conflict(local_broker.orders[request.client_order_id], existing, request)
-            if conflict:
-                raise ValueError(f"idempotency_conflict: {conflict}")
-            self._journal("live_order_submit_deduplicated", {"request": request, "acknowledgement": existing})
-            return existing
+        if existing is not None:
+            return self._recover_or_deduplicate_submit(local_broker, request, existing)
+        self._reconcile_or_raise(local_broker, "pre_submit")
         self._journal("live_order_intent", {"request": request})
         try:
             acknowledgement = self.broker_adapter.submit_order(request)
         except Exception as exc:
             self._journal("live_order_submit_error", {"request": request, "error": str(exc)})
             raise
-        ack_journal_error = None
-        try:
-            self._journal("live_order_ack", {"request": request, "acknowledgement": acknowledgement})
-        except Exception as exc:
-            ack_journal_error = exc
+        self._journal("live_order_ack", {"request": request, "acknowledgement": acknowledgement})
         snapshot = copy.deepcopy(local_broker)
         try:
-            if on_ack is not None:
-                on_ack(acknowledgement)
+            self._apply_external_order_ack(local_broker, acknowledgement)
+            if self._ack_requires_fill_stream(acknowledgement):
+                self.process_fills(local_broker)
             self._reconcile_or_raise(local_broker, "post_submit")
         except Exception as exc:
             local_broker.__dict__.clear()
@@ -486,44 +482,35 @@ class LiveExecutionLoop:
                 {"request": request, "acknowledgement": acknowledgement, "error": str(exc)},
             )
             raise
-        if ack_journal_error is not None:
-            raise ack_journal_error
         return acknowledgement
 
     def cancel_order(self, local_broker, external_id: str, on_ack=None):
-        if self._existing_external_order_by_external_id(external_id) is None:
+        if on_ack is not None:
+            raise ValueError("Custom on_ack hooks are not allowed in durable live order cancellation.")
+        self.replay_order_acks(local_broker)
+        existing = self._existing_external_order_by_external_id(external_id)
+        if existing is None:
+            recovered = self._recover_absent_cancel(local_broker, external_id)
+            if recovered is not None:
+                return recovered
             result = {"external_id": external_id, "status": "already_absent"}
             self._journal("live_cancel_deduplicated", result)
-            snapshot = copy.deepcopy(local_broker)
-            try:
-                if on_ack is not None:
-                    on_ack(result)
-                self._reconcile_or_raise(local_broker, "post_cancel_deduplicated")
-            except Exception as exc:
-                local_broker.__dict__.clear()
-                local_broker.__dict__.update(snapshot.__dict__)
-                self._journal(
-                    "live_cancel_transition_error",
-                    {"external_id": external_id, "acknowledgement": result, "error": str(exc)},
-                )
-                raise
+            self._reconcile_or_raise(local_broker, "post_cancel_deduplicated")
             return result
         self._reconcile_or_raise(local_broker, "pre_cancel")
-        self._journal("live_cancel_intent", {"external_id": external_id})
+        self._journal("live_cancel_intent", {"external_id": external_id, "external_order": existing})
         try:
             result = self.broker_adapter.cancel_order(external_id)
         except Exception as exc:
             self._journal("live_cancel_error", {"external_id": external_id, "error": str(exc)})
             raise
-        ack_journal_error = None
-        try:
-            self._journal("live_cancel_ack", {"external_id": external_id, "acknowledgement": result})
-        except Exception as exc:
-            ack_journal_error = exc
+        self._journal(
+            "live_cancel_ack",
+            {"external_id": external_id, "external_order": existing, "acknowledgement": result},
+        )
         snapshot = copy.deepcopy(local_broker)
         try:
-            if on_ack is not None:
-                on_ack(result)
+            self._apply_cancel_ack(local_broker, existing)
             self._reconcile_or_raise(local_broker, "post_cancel")
         except Exception as exc:
             local_broker.__dict__.clear()
@@ -533,8 +520,6 @@ class LiveExecutionLoop:
                 {"external_id": external_id, "acknowledgement": result, "error": str(exc)},
             )
             raise
-        if ack_journal_error is not None:
-            raise ack_journal_error
         return result
 
     def recover(self, local_broker):
@@ -563,6 +548,7 @@ class LiveExecutionLoop:
     def process_fills(self, local_broker, since=None, on_fill=None):
         if on_fill is not None:
             raise ValueError("Custom on_fill hooks are not allowed in durable live fill processing.")
+        self.replay_order_acks(local_broker)
         self.replay_applied_fills(local_broker)
         applied = []
         for fill in self.broker_adapter.stream_fills(since=since):
@@ -629,7 +615,23 @@ class LiveExecutionLoop:
             replayed.append(fill)
         return replayed
 
+    def replay_order_acks(self, local_broker):
+        replayed = []
+        for record in self.journal.read_all():
+            event_type = record.get("event_type")
+            payload = record.get("payload", {})
+            if event_type in {"live_order_ack", "live_order_recovered"}:
+                acknowledgement = payload.get("acknowledgement", {})
+                if acknowledgement:
+                    replayed.append(self._apply_external_order_ack(local_broker, self._external_order(acknowledgement)))
+            elif event_type in {"live_cancel_ack", "live_cancel_recovered"}:
+                external_order = payload.get("external_order", {})
+                if external_order:
+                    self._apply_cancel_ack(local_broker, self._external_order(external_order))
+        return replayed
+
     def _reconcile_or_raise(self, local_broker, stage):
+        self.replay_order_acks(local_broker)
         self.replay_applied_fills(local_broker)
         snapshot = self.broker_adapter.account_snapshot()
         report = self.reconciler.reconcile(local_broker, snapshot)
@@ -736,6 +738,128 @@ class LiveExecutionLoop:
         order.status = FILLED if order.remaining_quantity == 0 else PARTIALLY_FILLED
         local_broker.external_fill_ids.add(fill.external_fill_id)
 
+    def _recover_or_deduplicate_submit(self, local_broker, request: LiveOrderRequest, existing: ExternalOrder):
+        local_order = local_broker.orders.get(request.client_order_id)
+        if local_order is not None:
+            conflict = self._idempotency_conflict(local_order, existing, request)
+            if conflict:
+                raise ValueError(f"idempotency_conflict: {conflict}")
+            self._journal("live_order_submit_deduplicated", {"request": request, "acknowledgement": existing})
+            self._reconcile_or_raise(local_broker, "post_submit_deduplicated")
+            return existing
+        conflict = self._request_external_conflict(existing, request)
+        if conflict:
+            raise ValueError(f"idempotency_conflict: {conflict}")
+        self._journal("live_order_recover_intent", {"request": request, "acknowledgement": existing})
+        snapshot = copy.deepcopy(local_broker)
+        try:
+            self._apply_external_order_ack(local_broker, existing)
+            self._journal("live_order_recovered", {"request": request, "acknowledgement": existing})
+            self._reconcile_or_raise(local_broker, "post_submit_recovered")
+        except Exception as exc:
+            local_broker.__dict__.clear()
+            local_broker.__dict__.update(snapshot.__dict__)
+            self._journal(
+                "live_order_transition_error",
+                {"request": request, "acknowledgement": existing, "error": str(exc)},
+            )
+            raise
+        return existing
+
+    def _apply_external_order_ack(self, local_broker, external: ExternalOrder):
+        existing = local_broker.orders.get(external.client_order_id)
+        if existing is not None:
+            return existing
+        requires_fill_stream = self._ack_requires_fill_stream(external)
+        order = Order(
+            symbol=external.symbol,
+            side=external.side,
+            quantity=external.quantity,
+            submitted_at=external.submitted_at,
+            id=external.client_order_id,
+            status=OPEN if requires_fill_stream else self._local_status_from_external(external.status),
+            filled_quantity=Decimal("0"),
+            avg_fill_price=0.0 if requires_fill_stream else external.avg_fill_price,
+            order_type=external.order_type,
+            time_in_force=external.time_in_force,
+            limit_price=external.limit_price,
+            stop_price=external.stop_price,
+            reduce_only=external.reduce_only,
+        )
+        local_broker.orders[order.id] = order
+        return order
+
+    @staticmethod
+    def _ack_requires_fill_stream(external: ExternalOrder):
+        return external.status in {FILLED, PARTIALLY_FILLED} or external.filled_quantity > 0
+
+    @staticmethod
+    def _external_order(payload):
+        return payload if isinstance(payload, ExternalOrder) else ExternalOrder(**payload)
+
+    @staticmethod
+    def _local_status_from_external(status):
+        status = status.upper()
+        if status in {OPEN, "ACCEPTED", "PENDING", "NEW"}:
+            return OPEN
+        if status == PARTIALLY_FILLED:
+            return PARTIALLY_FILLED
+        if status == FILLED:
+            return FILLED
+        if status == "CANCELLED":
+            return CANCELLED
+        if status == "REJECTED":
+            return "REJECTED"
+        return status
+
+    @staticmethod
+    def _apply_cancel_ack(local_broker, external: ExternalOrder):
+        order = local_broker.orders.get(external.client_order_id)
+        if order is not None and order.status in {OPEN, PARTIALLY_FILLED}:
+            order.status = CANCELLED
+        return order
+
+    def _recover_absent_cancel(self, local_broker, external_id: str):
+        external = self._journaled_external_order(external_id)
+        if external is None:
+            return None
+        order = local_broker.orders.get(external.client_order_id)
+        if order is None or order.status not in {OPEN, PARTIALLY_FILLED}:
+            return None
+        result = {"external_id": external_id, "status": "already_absent", "recovered_local_cancel": True}
+        snapshot = copy.deepcopy(local_broker)
+        try:
+            self._journal(
+                "live_cancel_recovered",
+                {"external_id": external_id, "external_order": external, "acknowledgement": result},
+            )
+            self._apply_cancel_ack(local_broker, external)
+            self._reconcile_or_raise(local_broker, "post_cancel_recovered")
+        except Exception as exc:
+            local_broker.__dict__.clear()
+            local_broker.__dict__.update(snapshot.__dict__)
+            self._journal(
+                "live_cancel_transition_error",
+                {"external_id": external_id, "acknowledgement": result, "error": str(exc)},
+            )
+            raise
+        return result
+
+    def _journaled_external_order(self, external_id: str):
+        for record in reversed(self.journal.read_all()):
+            payload = record.get("payload", {})
+            candidates = []
+            event_type = record.get("event_type")
+            if event_type in {"live_cancel_intent", "live_cancel_ack", "live_cancel_recovered"}:
+                candidates.append(payload.get("external_order"))
+            for candidate in candidates:
+                if not candidate:
+                    continue
+                external = self._external_order(candidate)
+                if external.external_id == external_id:
+                    return external
+        return None
+
     def _existing_external_order(self, client_order_id):
         snapshot = self.broker_adapter.account_snapshot()
         for order in snapshot.orders:
@@ -759,6 +883,33 @@ class LiveExecutionLoop:
         external_qty = BrokerReconciler._decimal(external_order.quantity, "external order quantity")
         request_qty = BrokerReconciler._decimal(request.quantity, "request quantity")
         if local_qty != request_qty or external_qty != request_qty:
+            return "quantity mismatch"
+        if external_order.order_type.upper() != request.order_type:
+            return "order_type mismatch"
+        if external_order.time_in_force.upper() != request.time_in_force:
+            return "time_in_force mismatch"
+        if BrokerReconciler._decimal(external_order.limit_price or 0, "external limit price") != BrokerReconciler._decimal(
+            request.limit_price or 0,
+            "request limit price",
+        ):
+            return "limit_price mismatch"
+        if BrokerReconciler._decimal(external_order.stop_price or 0, "external stop price") != BrokerReconciler._decimal(
+            request.stop_price or 0,
+            "request stop price",
+        ):
+            return "stop_price mismatch"
+        if bool(external_order.reduce_only) != bool(request.reduce_only):
+            return "reduce_only mismatch"
+        return ""
+
+    def _request_external_conflict(self, external_order: ExternalOrder, request: LiveOrderRequest):
+        if external_order.symbol != request.symbol:
+            return "symbol mismatch"
+        if external_order.side.upper() != request.side:
+            return "side mismatch"
+        external_qty = BrokerReconciler._decimal(external_order.quantity, "external order quantity")
+        request_qty = BrokerReconciler._decimal(request.quantity, "request quantity")
+        if external_qty != request_qty:
             return "quantity mismatch"
         if external_order.order_type.upper() != request.order_type:
             return "order_type mismatch"

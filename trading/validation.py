@@ -453,6 +453,9 @@ class ModelApprovalRegistry:
         if missing_metadata:
             raise ValueError(f"Approval metadata missing required fields: {sorted(missing_metadata)}")
         self._validate_metadata(metadata, expected_model_hash=str(model_hash))
+        recomputed_report = self._compute_report_from_metadata(metadata, report["criteria"], str(model_hash))
+        self._validate_report_matches_sources(report, recomputed_report)
+        report = recomputed_report
         payload = self._read()
         record = {
             "model_hash": str(model_hash),
@@ -587,6 +590,8 @@ class ModelApprovalRegistry:
             raise ValueError("Validation report average_gross_exposure must be in [0, 1].")
         criteria = report["criteria"]
         for field in (
+            "long_threshold",
+            "transaction_cost_bps",
             "min_net_excess_return",
             "min_directional_accuracy",
             "min_active_period_fraction",
@@ -608,9 +613,15 @@ class ModelApprovalRegistry:
             criteria["min_regimes"],
             "criteria.min_regimes",
         )
+        criteria_long_threshold = float(criteria["long_threshold"])
+        criteria_transaction_cost_bps = float(criteria["transaction_cost_bps"])
         criteria_net_excess = float(criteria["min_net_excess_return"])
         criteria_directional_accuracy = float(criteria["min_directional_accuracy"])
         criteria_active_period_fraction = float(criteria["min_active_period_fraction"])
+        if not math.isfinite(criteria_long_threshold):
+            raise ValueError("Validation criteria long_threshold must be finite.")
+        if not math.isfinite(criteria_transaction_cost_bps) or criteria_transaction_cost_bps < 0:
+            raise ValueError("Validation criteria transaction_cost_bps must be finite and non-negative.")
         if not math.isfinite(criteria_net_excess):
             raise ValueError("Validation criteria min_net_excess_return must be finite.")
         if not math.isfinite(criteria_directional_accuracy) or not 0 <= criteria_directional_accuracy <= 1:
@@ -641,6 +652,72 @@ class ModelApprovalRegistry:
             raise ValueError("Validation report symbols do not satisfy criteria.")
         if regimes < criteria_regimes:
             raise ValueError("Validation report regimes do not satisfy criteria.")
+
+    @classmethod
+    def _compute_report_from_metadata(cls, metadata, criteria, expected_model_hash):
+        predictions = cls._load_records(metadata["prediction_file_path"], "prediction_results")
+        actuals = cls._load_records(metadata["actuals_file_path"], "actuals")
+        if not predictions:
+            raise ValueError("Approval prediction file contains no prediction records.")
+        if not actuals:
+            raise ValueError("Approval actuals file contains no actual records.")
+        cls._validate_prediction_sources(predictions, metadata, expected_model_hash)
+        report = AlphaValidationReport(
+            predictions=predictions,
+            actuals=actuals,
+            long_threshold=criteria["long_threshold"],
+            transaction_cost_bps=criteria["transaction_cost_bps"],
+            min_net_excess_return=criteria["min_net_excess_return"],
+            min_directional_accuracy=criteria["min_directional_accuracy"],
+            min_active_period_fraction=criteria["min_active_period_fraction"],
+            min_observations=criteria["min_observations"],
+            min_symbols=criteria["min_symbols"],
+            min_regimes=criteria["min_regimes"],
+        ).compute()
+        return report
+
+    @staticmethod
+    def _load_records(path, json_key):
+        path = Path(path).expanduser()
+        if path.suffix.lower() == ".json":
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                records = payload.get(json_key, payload.get("records", []))
+            else:
+                records = payload
+            if not isinstance(records, list):
+                raise ValueError(f"{path} must contain a list of records.")
+            return records
+        return pd.read_csv(path).to_dict("records")
+
+    @staticmethod
+    def _validate_prediction_sources(predictions, metadata, expected_model_hash):
+        universe = set(metadata.get("universe", []))
+        prediction_symbols = set()
+        for payload in predictions:
+            event = PredictionEvent.from_mapping(payload).validate()
+            if event.model_hash != expected_model_hash:
+                raise ValueError("Prediction file model_hash does not match approved model_hash.")
+            prediction_symbols.add(event.symbol)
+        if not prediction_symbols:
+            raise ValueError("Prediction file contains no symbols.")
+        if not prediction_symbols.issubset(universe):
+            raise ValueError("Prediction symbols must be a subset of approval metadata universe.")
+        oos_start = pd.Timestamp(metadata["oos_start"])
+        oos_end = pd.Timestamp(metadata["oos_end"])
+        if pd.isna(oos_start) or pd.isna(oos_end) or oos_start > oos_end:
+            raise ValueError("Approval metadata oos_start/oos_end must define a valid range.")
+        for payload in predictions:
+            target = pd.Timestamp(payload["target_timestamp"])
+            if target < oos_start or target > oos_end:
+                raise ValueError("Prediction target_timestamp falls outside approval OOS window.")
+
+    @classmethod
+    def _validate_report_matches_sources(cls, supplied_report, recomputed_report):
+        supplied = cls._json_safe(supplied_report)
+        recomputed = cls._json_safe(recomputed_report)
+        if supplied != recomputed:
+            raise ValueError("Validation report does not match immutable prediction/actuals files.")
 
     @staticmethod
     def _strict_positive_int(value, name):

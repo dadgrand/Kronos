@@ -5,14 +5,20 @@ import pytest
 
 from trading.paper import MarketBar, Position
 from trading.runner import PaperTradingRunner, PredictionEvent
-from trading.validation import ModelApprovalRegistry
+from trading.validation import AlphaValidationReport, ModelApprovalRegistry
 
 
-def approval_metadata(tmp_path, registry):
+def approval_metadata(tmp_path, registry, predictions=None, actuals=None, model_hash="abc123"):
     prediction_file = tmp_path / "predictions.json"
     actuals_file = tmp_path / "actuals.json"
-    prediction_file.write_text(json.dumps({"prediction_results": []}), encoding="utf-8")
-    actuals_file.write_text(json.dumps({"actuals": []}), encoding="utf-8")
+    prediction_file.write_text(
+        json.dumps({"prediction_results": ModelApprovalRegistry._json_safe(predictions or [])}),
+        encoding="utf-8",
+    )
+    actuals_file.write_text(
+        json.dumps({"actuals": ModelApprovalRegistry._json_safe(actuals or [])}),
+        encoding="utf-8",
+    )
     return {
         "prediction_file_path": str(prediction_file),
         "prediction_file_checksum": ModelApprovalRegistry.file_checksum(prediction_file),
@@ -21,7 +27,7 @@ def approval_metadata(tmp_path, registry):
         "oos_start": "2024-01-01",
         "oos_end": "2024-01-31",
         "universe": ["TEST"],
-        "model_hash": "abc123",
+        "model_hash": model_hash,
         "model_revision": "model-rev",
         "tokenizer_revision": "tokenizer-rev",
         "code_version": registry.code_version,
@@ -215,32 +221,27 @@ def test_runner_accepts_model_hash_from_verified_registry(tmp_path):
         min_symbols=1,
         min_regimes=1,
     )
-    metadata = approval_metadata(tmp_path, registry)
+    predictions = [
+        prediction_to_json(make_prediction("2024-01-02", predicted_close=101.0, asof="2024-01-01")),
+    ]
+    actuals = [
+        {"symbol": "TEST", "timestamp": "2024-01-01", "close": 100.0},
+        {"symbol": "TEST", "timestamp": "2024-01-02", "close": 101.0},
+    ]
+    metadata = approval_metadata(tmp_path, registry, predictions, actuals)
+    report = AlphaValidationReport(
+        predictions=predictions,
+        actuals=actuals,
+        min_net_excess_return=0.0,
+        min_directional_accuracy=0.5,
+        min_active_period_fraction=0.5,
+        min_observations=1,
+        min_symbols=1,
+        min_regimes=1,
+    ).compute()
     registry.approve(
         "abc123",
-        {
-            "accepted": True,
-            "failed_criteria": [],
-            "criteria": {
-                "min_net_excess_return": 0.0,
-                "min_directional_accuracy": 0.5,
-                "min_active_period_fraction": 0.5,
-                "min_observations": 1,
-                "min_symbols": 1,
-                "min_regimes": 1,
-            },
-            "observations": 1,
-            "symbols": 1,
-            "start": "2024-01-01",
-            "end": "2024-01-02",
-            "strategy_net_return": 0.0,
-            "baseline_return": 0.0,
-            "net_excess_return": 0.0,
-            "directional_accuracy": 1.0,
-            "active_period_fraction": 1.0,
-            "average_gross_exposure": 1.0,
-            "regime_metrics": [{"month": "2024-01"}],
-        },
+        report,
         metadata=metadata,
     )
     runner = PaperTradingRunner.create(
