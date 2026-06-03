@@ -1,0 +1,19 @@
+{
+  "mode": "shadow",
+  "venue": "binance_spot",
+  "symbols": ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"],
+  "interval": "1m",
+  "run_dir": "var/kronos_prod",
+  "model_key": "kronos-small",
+  "model_revision": "901c26c1332695a2a8f243eb2f37243a37bea320",
+  "tokenizer_revision": "0e0117387f39004a9016484a186a908917e22426",
+  "device": "cpu",
+  "cuda_visible_devices": null,
+  "max_gross_exposure": 0.5,
+  "max_symbol_exposure": 0.125,
+  "min_cash_fraction": 0.4,
+  "max_daily_loss": 0.02,
+  "max_drawdown_halt": 0.05,
+  "max_order_notional": null,
+  "shadow_gate_days": 30
+}
