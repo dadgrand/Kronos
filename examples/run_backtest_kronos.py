@@ -271,6 +271,7 @@ class KronosBacktester:
         if threshold < 0:
             raise ValueError("threshold must be non-negative.")
 
+        full_hist_df = hist_df.sort_index().copy()
         hist_df, pred_df = self.align_data(hist_df, pred_df)
         combined = pd.DataFrame(index=hist_df.index)
         combined["open"] = hist_df["open"].astype(float)
@@ -282,14 +283,21 @@ class KronosBacktester:
         )
         combined["symbol"] = pred_df["symbol"].astype(str)
         combined["predicted"] = pred_df["predicted_close"].astype(float)
+        reference_index = pd.DatetimeIndex(pred_df["prediction_asof"])
+        reference_close = full_hist_df["close"].reindex(reference_index)
+        if reference_close.isna().any():
+            missing = sorted(
+                pd.Timestamp(timestamp).isoformat()
+                for timestamp in reference_index[reference_close.isna()]
+            )
+            raise ValueError(f"Missing prediction_asof reference close for: {missing}")
+        combined["reference_close"] = reference_close.to_numpy(dtype=float)
         combined = combined.replace([np.inf, -np.inf], np.nan).dropna()
 
-        if len(combined) < 2:
-            raise ValueError("Need at least two aligned rows to compute forecast returns without look-ahead.")
+        if combined.empty:
+            raise ValueError("No aligned rows remain after applying prediction_asof reference closes.")
 
-        combined["prev_close"] = combined["actual"].shift(1)
-        combined["pred_return"] = combined["predicted"] / combined["prev_close"] - 1.0
-        combined = combined.dropna(subset=["prev_close", "pred_return"])
+        combined["pred_return"] = combined["predicted"] / combined["reference_close"] - 1.0
 
         short_signal = -1 if self.allow_short else 0
         combined["signal"] = np.where(

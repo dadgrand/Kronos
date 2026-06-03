@@ -21,6 +21,7 @@ def approval_metadata(tmp_path, registry):
         "oos_start": "2024-01-01",
         "oos_end": "2024-01-31",
         "universe": ["TEST"],
+        "model_hash": "abc123",
         "model_revision": "model-rev",
         "tokenizer_revision": "tokenizer-rev",
         "code_version": registry.code_version,
@@ -102,6 +103,20 @@ def test_runner_validates_prediction_execution_time():
         runner.process_bar(make_bar("2024-01-02"), make_prediction("2024-01-03"))
 
 
+def test_runner_rejects_prediction_asof_that_does_not_match_reference_close():
+    runner = create_runner(initial_cash=10000)
+    runner.process_bar(make_bar("2024-01-01", close=100))
+
+    with pytest.raises(ValueError, match="prediction_asof"):
+        runner.process_bar(
+            make_bar("2024-01-02", close=105),
+            make_prediction("2024-01-02", asof="2023-12-31"),
+        )
+
+    assert runner.broker.orders == {}
+    assert "2024-01-02" not in " ".join(runner.broker.processed_bars)
+
+
 def test_runner_state_round_trip(tmp_path):
     runner = create_runner(
         initial_cash=10000,
@@ -117,6 +132,7 @@ def test_runner_state_round_trip(tmp_path):
 
     assert restored.broker.cash == runner.broker.cash
     assert restored.last_close == runner.last_close
+    assert restored.last_close_timestamp == runner.last_close_timestamp
     assert restored.max_mark_age == runner.max_mark_age
     assert restored.report() == runner.report()
 
@@ -194,6 +210,10 @@ def test_runner_accepts_model_hash_from_verified_registry(tmp_path):
         tmp_path / "approvals.json",
         min_net_excess_return=0.0,
         min_directional_accuracy=0.5,
+        min_active_period_fraction=0.5,
+        min_observations=1,
+        min_symbols=1,
+        min_regimes=1,
     )
     metadata = approval_metadata(tmp_path, registry)
     registry.approve(
@@ -201,7 +221,14 @@ def test_runner_accepts_model_hash_from_verified_registry(tmp_path):
         {
             "accepted": True,
             "failed_criteria": [],
-            "criteria": {"min_net_excess_return": 0.0, "min_directional_accuracy": 0.5},
+            "criteria": {
+                "min_net_excess_return": 0.0,
+                "min_directional_accuracy": 0.5,
+                "min_active_period_fraction": 0.5,
+                "min_observations": 1,
+                "min_symbols": 1,
+                "min_regimes": 1,
+            },
             "observations": 1,
             "symbols": 1,
             "start": "2024-01-01",
@@ -210,6 +237,8 @@ def test_runner_accepts_model_hash_from_verified_registry(tmp_path):
             "baseline_return": 0.0,
             "net_excess_return": 0.0,
             "directional_accuracy": 1.0,
+            "active_period_fraction": 1.0,
+            "average_gross_exposure": 1.0,
             "regime_metrics": [{"month": "2024-01"}],
         },
         metadata=metadata,

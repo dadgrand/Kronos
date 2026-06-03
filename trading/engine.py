@@ -33,6 +33,9 @@ class PaperTradingEngine:
             raise ValueError("max_liquidation_attempts must be at least 1.")
         if production_mode and runner.approval_registry is None:
             raise ValueError("production_mode requires a runner with approval_registry.")
+        meets_production_floors = getattr(runner.approval_registry, "meets_production_floors", None)
+        if production_mode and (not callable(meets_production_floors) or not meets_production_floors()):
+            raise ValueError("production_mode requires an approval_registry with production floors.")
         if production_mode and not runner.approval_registry.accepted_model_hashes():
             raise ValueError("production_mode requires a verified non-empty approval_registry.")
         self.runner = runner
@@ -286,6 +289,7 @@ class PaperTradingEngine:
         return {
             "broker": copy.deepcopy(self.runner.broker),
             "last_close": copy.deepcopy(self.runner.last_close),
+            "last_close_timestamp": copy.deepcopy(self.runner.last_close_timestamp),
             "equity_history": copy.deepcopy(self.runner.equity_history),
             "signal_history": copy.deepcopy(self.runner.signal_history),
         }
@@ -293,6 +297,7 @@ class PaperTradingEngine:
     def _restore_runner(self, snapshot):
         self.runner.broker = snapshot["broker"]
         self.runner.last_close = snapshot["last_close"]
+        self.runner.last_close_timestamp = snapshot["last_close_timestamp"]
         self.runner.equity_history = snapshot["equity_history"]
         self.runner.signal_history = snapshot["signal_history"]
 

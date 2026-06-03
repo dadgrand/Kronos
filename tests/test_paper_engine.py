@@ -42,6 +42,28 @@ def make_prediction(timestamp, predicted_close=110.0, symbol="TEST"):
     )
 
 
+def approval_metadata(tmp_path, registry, model_hash="abc123"):
+    prediction_file = tmp_path / f"{model_hash}-predictions.json"
+    actuals_file = tmp_path / f"{model_hash}-actuals.json"
+    prediction_file.write_text(json.dumps({"prediction_results": []}), encoding="utf-8")
+    actuals_file.write_text(json.dumps({"actuals": []}), encoding="utf-8")
+    return {
+        "prediction_file_path": str(prediction_file),
+        "prediction_file_checksum": ModelApprovalRegistry.file_checksum(prediction_file),
+        "actuals_file_path": str(actuals_file),
+        "actuals_file_checksum": ModelApprovalRegistry.file_checksum(actuals_file),
+        "oos_start": "2024-01-01",
+        "oos_end": "2024-01-31",
+        "universe": ["TEST"],
+        "model_hash": model_hash,
+        "model_revision": "model-rev",
+        "tokenizer_revision": "tokenizer-rev",
+        "code_version": registry.code_version,
+        "code_manifest": registry.code_manifest,
+        "validation_code_checksum": registry.validation_code_checksum,
+    }
+
+
 def test_engine_journals_bar_prediction_fill_and_heartbeat(tmp_path):
     runner = create_runner(
         initial_cash=10000,
@@ -85,6 +107,53 @@ def test_engine_production_mode_requires_registry_backed_runner(tmp_path):
         assert "non-empty" in str(exc)
     else:
         raise AssertionError("Expected production_mode with empty registry to fail")
+
+
+def test_engine_production_mode_rejects_permissive_registry_floors(tmp_path):
+    registry = ModelApprovalRegistry(
+        tmp_path / "permissive-approvals.json",
+        min_net_excess_return=0.0,
+        min_directional_accuracy=0.5,
+        min_active_period_fraction=0.0,
+        min_observations=1,
+        min_symbols=1,
+        min_regimes=1,
+    )
+    registry.approve(
+        "abc123",
+        {
+            "accepted": True,
+            "failed_criteria": [],
+            "criteria": {
+                "min_net_excess_return": 0.0,
+                "min_directional_accuracy": 0.5,
+                "min_active_period_fraction": 0.0,
+                "min_observations": 1,
+                "min_symbols": 1,
+                "min_regimes": 1,
+            },
+            "observations": 1,
+            "symbols": 1,
+            "start": "2024-01-01",
+            "end": "2024-01-02",
+            "strategy_net_return": 0.0,
+            "baseline_return": 0.0,
+            "net_excess_return": 0.0,
+            "directional_accuracy": 1.0,
+            "active_period_fraction": 1.0,
+            "average_gross_exposure": 1.0,
+            "regime_metrics": [{"month": "2024-01"}],
+        },
+        metadata=approval_metadata(tmp_path, registry),
+    )
+    runner = PaperTradingRunner.create(initial_cash=10000, approval_registry=registry)
+
+    try:
+        PaperTradingEngine(runner=runner, journal=JsonlOrderJournal(tmp_path / "orders.jsonl"), production_mode=True)
+    except ValueError as exc:
+        assert "production floors" in str(exc)
+    else:
+        raise AssertionError("Expected production_mode with permissive registry floors to fail")
 
 
 def test_engine_kill_switch_liquidates_position(tmp_path):

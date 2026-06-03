@@ -52,7 +52,7 @@ def test_backtest_uses_realized_prices_and_flat_signals_without_ffill():
         },
         index=pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]),
     )
-    pred = make_prediction_frame(hist.index, [100.0, 110.0, 90.0, 120.0])
+    pred = make_prediction_frame(hist.index[1:], [110.0, 90.0, 120.0])
 
     backtester = KronosBacktester(
         ".",
@@ -72,6 +72,49 @@ def test_backtest_uses_realized_prices_and_flat_signals_without_ffill():
     assert [trade["action"] for trade in trades] == ["BUY", "SELL", "BUY"]
     assert trades[1]["price"] == 104.0
     assert results["capital"].iloc[-1] > 0
+
+
+def test_backtest_uses_prediction_asof_close_for_sparse_predictions():
+    hist = pd.DataFrame(
+        {
+            "open": [100.0, 50.0, 50.0],
+            "close": [100.0, 50.0, 50.0],
+        },
+        index=pd.to_datetime(["2024-01-01", "2024-01-03", "2024-01-04"]),
+    )
+    pred = make_prediction_frame(
+        ["2024-01-04"],
+        [110.0],
+        asofs=pd.to_datetime(["2024-01-01"]),
+        horizon="3D",
+    )
+
+    backtester = KronosBacktester(".", ".")
+    signals = backtester.calculate_trading_signals(hist, pred, threshold=0.5)
+
+    assert signals["reference_close"].tolist() == [100.0]
+    assert signals["pred_return"].tolist() == pytest.approx([0.1])
+    assert signals["position"].tolist() == [0]
+
+
+def test_backtest_rejects_missing_prediction_asof_reference_close():
+    hist = pd.DataFrame(
+        {
+            "open": [100.0],
+            "close": [100.0],
+        },
+        index=pd.to_datetime(["2024-01-02"]),
+    )
+    pred = make_prediction_frame(
+        ["2024-01-02"],
+        [110.0],
+        asofs=pd.to_datetime(["2024-01-01"]),
+    )
+
+    backtester = KronosBacktester(".", ".")
+
+    with pytest.raises(ValueError, match="reference close"):
+        backtester.calculate_trading_signals(hist, pred)
 
 
 def test_backtest_rejects_prediction_available_at_or_after_target():
@@ -139,7 +182,7 @@ def test_backtest_keeps_cash_non_negative_with_costs():
         },
         index=pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
     )
-    pred = make_prediction_frame(hist.index, [100.0, 110.0, 110.0])
+    pred = make_prediction_frame(hist.index[1:], [110.0, 110.0])
 
     backtester = KronosBacktester(
         ".",

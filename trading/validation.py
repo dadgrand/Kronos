@@ -26,6 +26,7 @@ class AlphaValidationReport:
         transaction_cost_bps=0.0,
         min_net_excess_return=None,
         min_directional_accuracy=None,
+        min_active_period_fraction=None,
         min_observations=30,
         min_symbols=1,
         min_regimes=1,
@@ -36,6 +37,7 @@ class AlphaValidationReport:
         self.transaction_cost_bps = float(transaction_cost_bps)
         self.min_net_excess_return = min_net_excess_return
         self.min_directional_accuracy = min_directional_accuracy
+        self.min_active_period_fraction = min_active_period_fraction
         self.min_observations = self._strict_int(min_observations, "min_observations")
         self.min_symbols = self._strict_int(min_symbols, "min_symbols")
         self.min_regimes = self._strict_int(min_regimes, "min_regimes")
@@ -76,11 +78,14 @@ class AlphaValidationReport:
         strategy_net_return = self._compound_return(portfolio_periods["strategy_period_return"])
         baseline_return = self._compound_return(portfolio_periods["baseline_period_return"])
         net_excess_return = strategy_net_return - baseline_return
+        active_period_fraction = float(portfolio_periods["gross_exposure"].gt(0).mean())
+        average_gross_exposure = float(portfolio_periods["gross_exposure"].mean())
         directional_accuracy = float(directional["direction_hit"].mean()) if not directional.empty else math.nan
         regime_metrics = self._monthly_regime_metrics(merged)
         failed_criteria = self._failed_criteria(
             net_excess_return,
             directional_accuracy,
+            active_period_fraction,
             observations=len(merged),
             symbols=merged["symbol"].nunique(),
             regimes=len(regime_metrics),
@@ -101,6 +106,8 @@ class AlphaValidationReport:
             "strategy_net_return": strategy_net_return,
             "baseline_return": baseline_return,
             "net_excess_return": net_excess_return,
+            "active_period_fraction": active_period_fraction,
+            "average_gross_exposure": average_gross_exposure,
             "turnover": float(portfolio_periods["turnover"].sum()),
             "accepted": not failed_criteria,
             "failed_criteria": failed_criteria,
@@ -109,6 +116,7 @@ class AlphaValidationReport:
                 "transaction_cost_bps": self.transaction_cost_bps,
                 "min_net_excess_return": self.min_net_excess_return,
                 "min_directional_accuracy": self.min_directional_accuracy,
+                "min_active_period_fraction": self.min_active_period_fraction,
                 "min_observations": self.min_observations,
                 "min_symbols": self.min_symbols,
                 "min_regimes": self.min_regimes,
@@ -202,6 +210,8 @@ class AlphaValidationReport:
                     "strategy_period_return": gross_return - turnover * cost_rate,
                     "baseline_period_return": float(group["actual_return"].mean()),
                     "turnover": turnover,
+                    "active_positions": len(active_symbols),
+                    "gross_exposure": sum(abs(weight) for weight in weights.values()),
                 }
             )
             previous_weights = weights
@@ -213,7 +223,15 @@ class AlphaValidationReport:
             return math.nan
         return float((1.0 + period_returns).prod() - 1.0)
 
-    def _failed_criteria(self, net_excess_return, directional_accuracy, observations, symbols, regimes):
+    def _failed_criteria(
+        self,
+        net_excess_return,
+        directional_accuracy,
+        active_period_fraction,
+        observations,
+        symbols,
+        regimes,
+    ):
         failed = []
         if observations < self.min_observations:
             failed.append(
@@ -255,6 +273,14 @@ class AlphaValidationReport:
                     "actual": "not configured",
                 }
             )
+        if self.min_active_period_fraction is None:
+            failed.append(
+                {
+                    "metric": "min_active_period_fraction",
+                    "minimum": "explicit threshold",
+                    "actual": "not configured",
+                }
+            )
         if self.min_net_excess_return is not None and net_excess_return < self.min_net_excess_return:
             failed.append(
                 {
@@ -274,6 +300,17 @@ class AlphaValidationReport:
                     "actual": float(directional_accuracy),
                 }
             )
+        if (
+            self.min_active_period_fraction is not None
+            and active_period_fraction < self.min_active_period_fraction
+        ):
+            failed.append(
+                {
+                    "metric": "active_period_fraction",
+                    "minimum": float(self.min_active_period_fraction),
+                    "actual": float(active_period_fraction),
+                }
+            )
         return failed
 
     def _validate_parameters(self):
@@ -284,11 +321,14 @@ class AlphaValidationReport:
         for name, value in (
             ("min_net_excess_return", self.min_net_excess_return),
             ("min_directional_accuracy", self.min_directional_accuracy),
+            ("min_active_period_fraction", self.min_active_period_fraction),
         ):
             if value is not None and not math.isfinite(float(value)):
                 raise ValueError(f"{name} must be finite when provided.")
         if self.min_directional_accuracy is not None and not 0 <= float(self.min_directional_accuracy) <= 1:
             raise ValueError("min_directional_accuracy must be in [0, 1].")
+        if self.min_active_period_fraction is not None and not 0 <= float(self.min_active_period_fraction) <= 1:
+            raise ValueError("min_active_period_fraction must be in [0, 1].")
         if self.min_observations < 1:
             raise ValueError("min_observations must be at least 1.")
         if self.min_symbols < 1:
@@ -299,6 +339,8 @@ class AlphaValidationReport:
             self.min_net_excess_return = float(self.min_net_excess_return)
         if self.min_directional_accuracy is not None:
             self.min_directional_accuracy = float(self.min_directional_accuracy)
+        if self.min_active_period_fraction is not None:
+            self.min_active_period_fraction = float(self.min_active_period_fraction)
 
     @staticmethod
     def _strict_int(value, name):
@@ -314,6 +356,13 @@ class AlphaValidationReport:
 
 class ModelApprovalRegistry:
     """Durable model_hash -> accepted validation report registry."""
+
+    PRODUCTION_MIN_NET_EXCESS_RETURN = 0.01
+    PRODUCTION_MIN_DIRECTIONAL_ACCURACY = 0.52
+    PRODUCTION_MIN_ACTIVE_PERIOD_FRACTION = 0.10
+    PRODUCTION_MIN_OBSERVATIONS = 1000
+    PRODUCTION_MIN_SYMBOLS = 6
+    PRODUCTION_MIN_REGIMES = 12
 
     CODE_MANIFEST_PATHS = (
         "trading/validation.py",
@@ -332,6 +381,7 @@ class ModelApprovalRegistry:
         "oos_start",
         "oos_end",
         "universe",
+        "model_hash",
         "model_revision",
         "tokenizer_revision",
         "code_version",
@@ -342,8 +392,12 @@ class ModelApprovalRegistry:
     def __init__(
         self,
         path,
-        min_net_excess_return=0.01,
-        min_directional_accuracy=0.52,
+        min_net_excess_return=PRODUCTION_MIN_NET_EXCESS_RETURN,
+        min_directional_accuracy=PRODUCTION_MIN_DIRECTIONAL_ACCURACY,
+        min_active_period_fraction=PRODUCTION_MIN_ACTIVE_PERIOD_FRACTION,
+        min_observations=PRODUCTION_MIN_OBSERVATIONS,
+        min_symbols=PRODUCTION_MIN_SYMBOLS,
+        min_regimes=PRODUCTION_MIN_REGIMES,
         required_metadata=None,
         code_version=None,
         validation_code_path=None,
@@ -353,6 +407,16 @@ class ModelApprovalRegistry:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.min_net_excess_return = float(min_net_excess_return)
         self.min_directional_accuracy = float(min_directional_accuracy)
+        self.min_active_period_fraction = float(min_active_period_fraction)
+        self.min_observations = self._strict_positive_int(min_observations, "min_observations")
+        self.min_symbols = self._strict_positive_int(min_symbols, "min_symbols")
+        self.min_regimes = self._strict_positive_int(min_regimes, "min_regimes")
+        if not math.isfinite(self.min_net_excess_return):
+            raise ValueError("min_net_excess_return must be finite.")
+        if not math.isfinite(self.min_directional_accuracy) or not 0 <= self.min_directional_accuracy <= 1:
+            raise ValueError("min_directional_accuracy must be in [0, 1].")
+        if not math.isfinite(self.min_active_period_fraction) or not 0 <= self.min_active_period_fraction <= 1:
+            raise ValueError("min_active_period_fraction must be in [0, 1].")
         self.required_metadata = set(required_metadata or self.REQUIRED_METADATA)
         self.code_version = str(code_version or self.current_code_version())
         self.validation_code_path = Path(validation_code_path or __file__)
@@ -360,17 +424,35 @@ class ModelApprovalRegistry:
         self.code_manifest_paths = tuple(code_manifest_paths or self.CODE_MANIFEST_PATHS)
         self.code_manifest = self.current_code_manifest(self.code_manifest_paths)
 
+    def meets_production_floors(self):
+        return (
+            self.min_net_excess_return >= self.PRODUCTION_MIN_NET_EXCESS_RETURN
+            and self.min_directional_accuracy >= self.PRODUCTION_MIN_DIRECTIONAL_ACCURACY
+            and self.min_active_period_fraction >= self.PRODUCTION_MIN_ACTIVE_PERIOD_FRACTION
+            and self.min_observations >= self.PRODUCTION_MIN_OBSERVATIONS
+            and self.min_symbols >= self.PRODUCTION_MIN_SYMBOLS
+            and self.min_regimes >= self.PRODUCTION_MIN_REGIMES
+        )
+
     def approve(self, model_hash, report, metadata=None):
-        self._validate_report_schema(report, self.min_net_excess_return, self.min_directional_accuracy)
-        metadata = metadata or {}
-        missing_metadata = self.required_metadata - set(metadata)
-        if missing_metadata:
-            raise ValueError(f"Approval metadata missing required fields: {sorted(missing_metadata)}")
-        self._validate_metadata(metadata)
+        self._validate_report_schema(
+            report,
+            self.min_net_excess_return,
+            self.min_directional_accuracy,
+            self.min_active_period_fraction,
+            self.min_observations,
+            self.min_symbols,
+            self.min_regimes,
+        )
         if not report.get("accepted"):
             raise ValueError("Only accepted validation reports can be registered.")
         if report.get("failed_criteria"):
             raise ValueError("Validation report with failed criteria cannot be registered.")
+        metadata = metadata or {}
+        missing_metadata = self.required_metadata - set(metadata)
+        if missing_metadata:
+            raise ValueError(f"Approval metadata missing required fields: {sorted(missing_metadata)}")
+        self._validate_metadata(metadata, expected_model_hash=str(model_hash))
         payload = self._read()
         record = {
             "model_hash": str(model_hash),
@@ -412,11 +494,15 @@ class ModelApprovalRegistry:
             missing_metadata = self.required_metadata - set(record.get("metadata", {}))
             if missing_metadata:
                 raise ValueError(f"Approval metadata missing required fields: {sorted(missing_metadata)}")
-            self._validate_metadata(record.get("metadata", {}))
+            self._validate_metadata(record.get("metadata", {}), expected_model_hash=model_hash)
             self._validate_report_schema(
                 record.get("report", {}),
                 self.min_net_excess_return,
                 self.min_directional_accuracy,
+                self.min_active_period_fraction,
+                self.min_observations,
+                self.min_symbols,
+                self.min_regimes,
             )
             if not record["report"].get("accepted") or record["report"].get("failed_criteria"):
                 raise ValueError("Approval registry contains an unaccepted report.")
@@ -428,7 +514,15 @@ class ModelApprovalRegistry:
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _validate_report_schema(report, min_net_excess_return=0.0, min_directional_accuracy=0.5):
+    def _validate_report_schema(
+        report,
+        min_net_excess_return=0.0,
+        min_directional_accuracy=0.5,
+        min_active_period_fraction=0.0,
+        min_observations=1,
+        min_symbols=1,
+        min_regimes=1,
+    ):
         required = {
             "accepted",
             "failed_criteria",
@@ -441,6 +535,8 @@ class ModelApprovalRegistry:
             "baseline_return",
             "net_excess_return",
             "directional_accuracy",
+            "active_period_fraction",
+            "average_gross_exposure",
             "regime_metrics",
         }
         missing = required - set(report)
@@ -471,24 +567,80 @@ class ModelApprovalRegistry:
             raise ValueError("Validation report must include non-empty regime_metrics.")
         if any(not isinstance(item, dict) for item in report["regime_metrics"]):
             raise ValueError("Validation report regime_metrics must contain dict entries.")
-        for field in ("strategy_net_return", "baseline_return", "net_excess_return", "directional_accuracy"):
+        regimes = len(report["regime_metrics"])
+        for field in (
+            "strategy_net_return",
+            "baseline_return",
+            "net_excess_return",
+            "directional_accuracy",
+            "active_period_fraction",
+            "average_gross_exposure",
+        ):
             value = float(report[field])
             if not math.isfinite(value):
                 raise ValueError(f"Validation report {field} must be finite.")
         if not 0 <= float(report["directional_accuracy"]) <= 1:
             raise ValueError("Validation report directional_accuracy must be in [0, 1].")
+        if not 0 <= float(report["active_period_fraction"]) <= 1:
+            raise ValueError("Validation report active_period_fraction must be in [0, 1].")
+        if not 0 <= float(report["average_gross_exposure"]) <= 1:
+            raise ValueError("Validation report average_gross_exposure must be in [0, 1].")
         criteria = report["criteria"]
-        for field in ("min_net_excess_return", "min_directional_accuracy"):
+        for field in (
+            "min_net_excess_return",
+            "min_directional_accuracy",
+            "min_active_period_fraction",
+            "min_observations",
+            "min_symbols",
+            "min_regimes",
+        ):
             if criteria.get(field) is None:
                 raise ValueError(f"Validation report criteria.{field} is required.")
-        if float(criteria["min_net_excess_return"]) < float(min_net_excess_return):
+        criteria_observations = ModelApprovalRegistry._strict_positive_int(
+            criteria["min_observations"],
+            "criteria.min_observations",
+        )
+        criteria_symbols = ModelApprovalRegistry._strict_positive_int(
+            criteria["min_symbols"],
+            "criteria.min_symbols",
+        )
+        criteria_regimes = ModelApprovalRegistry._strict_positive_int(
+            criteria["min_regimes"],
+            "criteria.min_regimes",
+        )
+        criteria_net_excess = float(criteria["min_net_excess_return"])
+        criteria_directional_accuracy = float(criteria["min_directional_accuracy"])
+        criteria_active_period_fraction = float(criteria["min_active_period_fraction"])
+        if not math.isfinite(criteria_net_excess):
+            raise ValueError("Validation criteria min_net_excess_return must be finite.")
+        if not math.isfinite(criteria_directional_accuracy) or not 0 <= criteria_directional_accuracy <= 1:
+            raise ValueError("Validation criteria min_directional_accuracy must be in [0, 1].")
+        if not math.isfinite(criteria_active_period_fraction) or not 0 <= criteria_active_period_fraction <= 1:
+            raise ValueError("Validation criteria min_active_period_fraction must be in [0, 1].")
+        if criteria_net_excess < float(min_net_excess_return):
             raise ValueError("Validation criteria min_net_excess_return is below registry floor.")
-        if float(criteria["min_directional_accuracy"]) < float(min_directional_accuracy):
+        if criteria_directional_accuracy < float(min_directional_accuracy):
             raise ValueError("Validation criteria min_directional_accuracy is below registry floor.")
-        if float(report["net_excess_return"]) < float(criteria["min_net_excess_return"]):
+        if criteria_active_period_fraction < float(min_active_period_fraction):
+            raise ValueError("Validation criteria min_active_period_fraction is below registry floor.")
+        if criteria_observations < int(min_observations):
+            raise ValueError("Validation criteria min_observations is below registry floor.")
+        if criteria_symbols < int(min_symbols):
+            raise ValueError("Validation criteria min_symbols is below registry floor.")
+        if criteria_regimes < int(min_regimes):
+            raise ValueError("Validation criteria min_regimes is below registry floor.")
+        if float(report["net_excess_return"]) < criteria_net_excess:
             raise ValueError("Validation report net_excess_return does not satisfy criteria.")
-        if float(report["directional_accuracy"]) < float(criteria["min_directional_accuracy"]):
+        if float(report["directional_accuracy"]) < criteria_directional_accuracy:
             raise ValueError("Validation report directional_accuracy does not satisfy criteria.")
+        if float(report["active_period_fraction"]) < criteria_active_period_fraction:
+            raise ValueError("Validation report active_period_fraction does not satisfy criteria.")
+        if observations < criteria_observations:
+            raise ValueError("Validation report observations do not satisfy criteria.")
+        if symbols < criteria_symbols:
+            raise ValueError("Validation report symbols do not satisfy criteria.")
+        if regimes < criteria_regimes:
+            raise ValueError("Validation report regimes do not satisfy criteria.")
 
     @staticmethod
     def _strict_positive_int(value, name):
@@ -504,7 +656,7 @@ class ModelApprovalRegistry:
             raise ValueError(f"Validation report {name} must be an integer.")
         return converted
 
-    def _validate_metadata(self, metadata):
+    def _validate_metadata(self, metadata, expected_model_hash=None):
         for key, value in metadata.items():
             if value is None:
                 raise ValueError(f"Approval metadata {key} must be populated.")
@@ -515,6 +667,8 @@ class ModelApprovalRegistry:
             raise ValueError("Approval metadata universe must be a non-empty list.")
         if any(not isinstance(symbol, str) or not symbol.strip() for symbol in universe):
             raise ValueError("Approval metadata universe entries must be populated strings.")
+        if expected_model_hash is not None and str(metadata.get("model_hash")) != str(expected_model_hash):
+            raise ValueError("Approval metadata model_hash does not match approved model_hash.")
         self._validate_metadata_file_checksum(metadata, "prediction_file_path", "prediction_file_checksum")
         self._validate_metadata_file_checksum(metadata, "actuals_file_path", "actuals_file_checksum")
         if "code_version" in self.required_metadata or "code_version" in metadata:

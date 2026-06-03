@@ -109,6 +109,7 @@ class PaperTradingRunner:
         if self.require_approval_registry and self.approval_registry is None:
             raise ValueError("approval_registry is required when require_approval_registry=True.")
         self.last_close: dict[str, float] = {}
+        self.last_close_timestamp: dict[str, pd.Timestamp] = {}
         self.equity_history: list[dict] = []
         self.signal_history: list[dict] = []
 
@@ -186,6 +187,7 @@ class PaperTradingRunner:
         self.broker.risk_manager.update(equity)
         position = self.broker.positions.get(bar.symbol)
         self.last_close[bar.symbol] = float(bar.close)
+        self.last_close_timestamp[bar.symbol] = pd.Timestamp(bar.timestamp)
         self.equity_history.append(
             {
                 "timestamp": bar.timestamp,
@@ -210,7 +212,8 @@ class PaperTradingRunner:
 
     def _submit_target_order(self, bar: MarketBar, prediction: PredictionEvent):
         previous_close = self.last_close.get(bar.symbol)
-        if previous_close is None:
+        previous_close_timestamp = self.last_close_timestamp.get(bar.symbol)
+        if previous_close is None or previous_close_timestamp is None:
             self.signal_history.append(
                 {
                     "timestamp": bar.timestamp,
@@ -220,6 +223,10 @@ class PaperTradingRunner:
                 }
             )
             return None
+        if pd.Timestamp(previous_close_timestamp) != pd.Timestamp(prediction.prediction_asof):
+            raise ValueError(
+                "prediction_asof must match the latest processed close timestamp for the symbol."
+            )
 
         predicted_return = prediction.predicted_close / previous_close - 1.0
         signal = 1 if predicted_return > self.threshold else 0
@@ -310,6 +317,10 @@ class PaperTradingRunner:
             "approval_registry_path": str(getattr(self.approval_registry, "path", "")),
             "require_approval_registry": self.require_approval_registry,
             "last_close": self.last_close,
+            "last_close_timestamp": {
+                symbol: pd.Timestamp(timestamp).isoformat()
+                for symbol, timestamp in self.last_close_timestamp.items()
+            },
             "equity_history": self._serialize_records(self.equity_history),
             "signal_history": self._serialize_records(self.signal_history),
         }
@@ -344,6 +355,10 @@ class PaperTradingRunner:
             require_approval_registry=payload.get("require_approval_registry", False),
         )
         runner.last_close = {symbol: float(value) for symbol, value in payload["last_close"].items()}
+        runner.last_close_timestamp = {
+            symbol: pd.Timestamp(value)
+            for symbol, value in payload.get("last_close_timestamp", {}).items()
+        }
         runner.equity_history = cls._deserialize_records(payload["equity_history"])
         runner.signal_history = cls._deserialize_records(payload["signal_history"])
         return runner
