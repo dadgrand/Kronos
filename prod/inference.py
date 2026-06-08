@@ -84,7 +84,7 @@ class KronosModelPredictor:
         model_id, tokenizer_id, max_context = MODEL_IDS[self.config.model_key]
         tokenizer = KronosTokenizer.from_pretrained(tokenizer_id, revision=self.config.tokenizer_revision)
         model = Kronos.from_pretrained(model_id, revision=self.config.model_revision)
-        self._predictor = KronosPredictor(model, tokenizer, max_context=max_context)
+        self._predictor = KronosPredictor(model, tokenizer, device=self.config.device, max_context=max_context)
         return self._predictor
 
 
