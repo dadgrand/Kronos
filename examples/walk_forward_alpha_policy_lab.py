@@ -33,6 +33,73 @@ class AlphaCandidate:
     rebalance_every: int
 
 
+CONFIG_FIELDS = [
+    "dataset_dir",
+    "interval",
+    "horizon",
+    "start_date",
+    "end_date",
+    "validation_days",
+    "test_days",
+    "step_days",
+    "max_windows",
+    "alpha_lags",
+    "alpha_kinds",
+    "alpha_normalize",
+    "modes",
+    "k_grid",
+    "gross_grid",
+    "rebalance_grid",
+    "initial_cash",
+    "cost_bps",
+    "stress_cost_bps",
+    "drawdown_penalty",
+    "turnover_penalty",
+    "segment_selection_penalty",
+    "stress_selection_weight",
+    "min_validation_return_pct",
+    "min_validation_stress_return_pct",
+    "min_validation_segment_return_pct",
+    "max_validation_drawdown_pct",
+    "segment_count",
+    "target_return_pct",
+]
+
+
+def args_to_config(args: argparse.Namespace) -> dict:
+    config = {}
+    for field in CONFIG_FIELDS:
+        value = getattr(args, field)
+        config[field] = str(value) if isinstance(value, Path) else value
+    return {
+        "protocol_name": "strict_walk_forward_alpha_policy_v1",
+        "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "config": config,
+        "notes": (
+            "Frozen research protocol. Command-line values explicitly different "
+            "from parser defaults may override matching config fields for fresh "
+            "forward runs; otherwise this config supplies the protocol."
+        ),
+    }
+
+
+def apply_config_defaults(parser: argparse.ArgumentParser, args: argparse.Namespace, config_path: Path | None) -> None:
+    if config_path is None:
+        return
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    config = payload.get("config", payload)
+    for field, value in config.items():
+        if field not in CONFIG_FIELDS or not hasattr(args, field):
+            continue
+        current = getattr(args, field)
+        default = parser.get_default(field)
+        if current != default:
+            continue
+        if field == "dataset_dir" and value is not None:
+            value = Path(value)
+        setattr(args, field, value)
+
+
 def cs_zscore(frame: pd.DataFrame) -> pd.DataFrame:
     mean = frame.mean(axis=1)
     std = frame.std(axis=1).replace(0.0, np.nan)
@@ -158,8 +225,18 @@ def main() -> None:
     parser.add_argument("--max-validation-drawdown-pct", type=float, default=8.0)
     parser.add_argument("--segment-count", type=int, default=5)
     parser.add_argument("--target-return-pct", type=float, default=10.0)
+    parser.add_argument("--config-json", type=Path, default=None)
+    parser.add_argument("--write-config-json", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()
+    apply_config_defaults(parser, args, args.config_json)
+
+    if args.write_config_json is not None:
+        args.write_config_json.parent.mkdir(parents=True, exist_ok=True)
+        args.write_config_json.write_text(
+            json.dumps(args_to_config(args), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     index, symbols, open_px, close_px, volume = read_intraday_matrix(args.dataset_dir, args.interval)
     matrices = build_matrices(open_px, close_px, volume, args.horizon)
@@ -443,6 +520,8 @@ def main() -> None:
         "worst_trade_window_test_return_pct": float(traded["test_return_pct"].min()) if len(traded) else 0.0,
         "mean_trade_window_test_return_pct": float(traded["test_return_pct"].mean()) if len(traded) else 0.0,
         "worst_window_test_max_drawdown_pct": float(window_results["test_max_drawdown_pct"].min()),
+        "config_json": str(args.config_json) if args.config_json else None,
+        "frozen_protocol_config": args_to_config(args)["config"],
         "protocol": (
             "For each window, alpha and execution parameters are selected on the validation slice only. "
             "A cash fallback is used when no candidate satisfies the validation robustness constraints. "

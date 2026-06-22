@@ -29,6 +29,17 @@ relying on the fragile single-window neural-score result.
   --output-dir outputs\walk_forward_alpha_policy_strict_20260622
 ```
 
+The protocol is now frozen in `configs/strict_alpha_policy_20260622.json`.
+It can be replayed with:
+
+```powershell
+.\.venv\Scripts\python.exe examples\walk_forward_alpha_policy_lab.py `
+  --config-json configs\strict_alpha_policy_20260622.json `
+  --output-dir outputs\frozen_alpha_policy_replay_20260622
+```
+
+Replay artifacts are saved in `reports/frozen_alpha_policy_replay_20260622`.
+
 Default strict gate:
 
 - `min_validation_return_pct = 5.0`
