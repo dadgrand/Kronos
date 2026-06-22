@@ -271,6 +271,20 @@ def selection_score(summary: dict, drawdown_penalty: float, turnover_penalty: fl
     )
 
 
+def robust_selection_score(
+    summary: dict,
+    *,
+    drawdown_penalty: float,
+    turnover_penalty: float,
+    segment_penalty: float,
+    worst_segment_return_pct: float | None,
+) -> float:
+    base_score = selection_score(summary, drawdown_penalty, turnover_penalty)
+    if worst_segment_return_pct is None:
+        return base_score
+    return base_score + segment_penalty * float(worst_segment_return_pct)
+
+
 def segment_diagnostics(
     bars: pd.DataFrame,
     *,
@@ -334,6 +348,8 @@ def main() -> None:
     parser.add_argument("--cost-bps", type=float, default=10.0)
     parser.add_argument("--drawdown-penalty", type=float, default=0.35)
     parser.add_argument("--turnover-penalty", type=float, default=2.0)
+    parser.add_argument("--segment-selection-penalty", type=float, default=0.0)
+    parser.add_argument("--min-validation-segment-return-pct", type=float, default=None)
     parser.add_argument("--target-return-pct", type=float, default=10.0)
     parser.add_argument("--segment-count", type=int, default=5)
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -376,7 +392,7 @@ def main() -> None:
 
     rows = []
     for policy in policies:
-        summary, _ = backtest_stop_aware(
+        summary, validation_bars_for_policy = backtest_stop_aware(
             scores,
             matrices,
             masks,
@@ -387,15 +403,50 @@ def main() -> None:
             initial_cash=args.initial_cash,
             cost_bps=args.cost_bps,
         )
+        validation_segments_for_policy = segment_diagnostics(
+            validation_bars_for_policy,
+            split="validation",
+            initial_cash=args.initial_cash,
+            segment_count=args.segment_count,
+        )
+        worst_segment_return_pct = (
+            float(validation_segments_for_policy["return_pct"].min())
+            if not validation_segments_for_policy.empty
+            else None
+        )
+        min_segment_ok = (
+            args.min_validation_segment_return_pct is None
+            or (
+                worst_segment_return_pct is not None
+                and worst_segment_return_pct >= args.min_validation_segment_return_pct
+            )
+        )
+        raw_selection_score = selection_score(summary, args.drawdown_penalty, args.turnover_penalty)
+        selected_score = (
+            robust_selection_score(
+                summary,
+                drawdown_penalty=args.drawdown_penalty,
+                turnover_penalty=args.turnover_penalty,
+                segment_penalty=args.segment_selection_penalty,
+                worst_segment_return_pct=worst_segment_return_pct,
+            )
+            if min_segment_ok
+            else -np.inf
+        )
         rows.append(
             {
                 **asdict(policy),
                 **{f"validation_{key}": value for key, value in summary.items() if key != "split"},
-                "selection_score": selection_score(summary, args.drawdown_penalty, args.turnover_penalty),
+                "raw_selection_score": raw_selection_score,
+                "worst_validation_segment_return_pct": worst_segment_return_pct,
+                "min_validation_segment_ok": min_segment_ok,
+                "selection_score": selected_score,
             }
         )
 
     search = pd.DataFrame(rows).sort_values(["selection_score", "validation_return_pct"], ascending=False)
+    if not np.isfinite(float(search.iloc[0]["selection_score"])):
+        raise ValueError("No policy satisfied the validation segment constraints.")
     selected = StopAwarePolicy(
         mode=str(search.iloc[0]["mode"]),
         k=int(search.iloc[0]["k"]),
@@ -489,6 +540,10 @@ def main() -> None:
         "policy_count": len(policies),
         "initial_cash": args.initial_cash,
         "cost_bps": args.cost_bps,
+        "drawdown_penalty": args.drawdown_penalty,
+        "turnover_penalty": args.turnover_penalty,
+        "segment_selection_penalty": args.segment_selection_penalty,
+        "min_validation_segment_return_pct": args.min_validation_segment_return_pct,
         "target_return_pct": args.target_return_pct,
         "segment_count": args.segment_count,
         "selected_policy": asdict(selected),
