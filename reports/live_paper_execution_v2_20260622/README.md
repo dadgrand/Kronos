@@ -11,6 +11,7 @@ It keeps the neural score ensemble from the research pipeline, but changes the l
 - can optionally close after N consecutive weak/blocked filter signals with `--exit-on-filter-fail --filter-fail-exit-bars N`;
 - closes any remaining paper position at the end of the run and reports realized final equity;
 - logs every action with candidate, edge estimate, turnover, costs, and equity.
+- can load a frozen research policy with `--policy-json`, including gross, mode, confidence, and market-regime gates.
 
 ## Conservative live paper command
 

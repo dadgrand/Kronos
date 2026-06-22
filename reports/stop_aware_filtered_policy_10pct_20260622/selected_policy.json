@@ -1,0 +1,12 @@
+{
+  "mode": "short_only",
+  "k": 1,
+  "gross": 1.5,
+  "rebalance_every": 24,
+  "confidence_min": 0.035875335335731506,
+  "market_mom_24_max": 0.002567113547411282,
+  "market_mom_96_max": 3.8395675483115644e-05,
+  "stop_loss_pct": null,
+  "take_profit_pct": null,
+  "filter_fail_exit_bars": null
+}

@@ -30,6 +30,8 @@ class PositionState:
     entry_equity: float | None = None
     entry_time: str | None = None
     opened_by: str | None = None
+    bars_held: int = 0
+    last_candle: str | None = None
 
 
 @dataclass(frozen=True)
@@ -42,7 +44,36 @@ class Candidate:
     reason: str
 
 
-BLOCKING_CANDIDATE_REASONS = {"filter_blocked", "edge_below_cost_gate", "no_tradable_price"}
+BLOCKING_CANDIDATE_REASONS = {
+    "filter_blocked",
+    "confidence_below_policy_min",
+    "edge_below_cost_gate",
+    "no_tradable_price",
+}
+
+
+def load_policy(path: Path | None) -> dict:
+    if path is None:
+        return dict(FINAL_POLICY)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if "selected_policy" in payload:
+        payload = payload["selected_policy"]
+    policy = dict(FINAL_POLICY)
+    for key in [
+        "mode",
+        "k",
+        "gross",
+        "rebalance_every",
+        "confidence_min",
+        "market_mom_24_max",
+        "market_mom_96_max",
+    ]:
+        if key in payload and payload[key] is not None:
+            policy[key] = payload[key]
+    for key in ["stop_loss_pct", "take_profit_pct", "filter_fail_exit_bars"]:
+        if key in payload:
+            policy[key] = payload[key]
+    return policy
 
 
 def finite_price(value: object) -> float | None:
@@ -77,6 +108,7 @@ def select_candidate(
     gross: float,
     confidence_to_bps: float,
     required_edge_bps: float,
+    min_confidence: float,
     filter_pass: bool,
 ) -> Candidate:
     if not filter_pass:
@@ -110,6 +142,8 @@ def select_candidate(
         raise ValueError(f"unknown mode: {mode}")
 
     confidence = side_confidence(scores, tradable, side)
+    if confidence < min_confidence:
+        return Candidate(None, 0.0, confidence, confidence * confidence_to_bps, None, "confidence_below_policy_min")
     edge_bps = confidence * confidence_to_bps
     if edge_bps < required_edge_bps:
         return Candidate(None, 0.0, confidence, edge_bps, None, "edge_below_cost_gate")
@@ -194,11 +228,11 @@ def decide_action(
     equity: float,
     mark_price: float | None,
     *,
-    stop_loss_pct: float,
-    take_profit_pct: float,
+    stop_loss_pct: float | None,
+    take_profit_pct: float | None,
     exit_on_filter_fail: bool,
     filter_fail_count: int,
-    filter_fail_exit_bars: int,
+    filter_fail_exit_bars: int | None,
     switch_target: bool,
 ) -> tuple[str, str | None, float]:
     if state.symbol is None:
@@ -210,13 +244,14 @@ def decide_action(
         return "hold_no_mark", state.symbol, 0.0
 
     position_return_pct = (equity / state.entry_equity - 1.0) * 100.0
-    if position_return_pct <= -abs(stop_loss_pct):
+    if stop_loss_pct is not None and position_return_pct <= -abs(stop_loss_pct):
         return "close_stop_loss", None, 0.0
-    if position_return_pct >= abs(take_profit_pct):
+    if take_profit_pct is not None and position_return_pct >= abs(take_profit_pct):
         return "close_take_profit", None, 0.0
     if (
         exit_on_filter_fail
         and candidate.reason in BLOCKING_CANDIDATE_REASONS
+        and filter_fail_exit_bars is not None
         and filter_fail_count >= max(1, filter_fail_exit_bars)
     ):
         return f"close_{candidate.reason}_{filter_fail_count}bars", None, 0.0
@@ -235,16 +270,17 @@ def main() -> None:
     parser.add_argument("--poll-seconds", type=float, default=60.0)
     parser.add_argument("--initial-cash", type=float, default=10000.0)
     parser.add_argument("--cost-bps", type=float, default=10.0)
-    parser.add_argument("--mode", choices=["short_only", "long_only", "long_short"], default="long_short")
-    parser.add_argument("--max-gross", type=float, default=1.0)
+    parser.add_argument("--mode", choices=["short_only", "long_only", "long_short"], default=None)
+    parser.add_argument("--max-gross", type=float, default=None)
     parser.add_argument("--confidence-to-bps", type=float, default=1000.0)
     parser.add_argument("--min-expected-edge-bps", type=float, default=10.0)
-    parser.add_argument("--stop-loss-pct", type=float, default=0.75)
-    parser.add_argument("--take-profit-pct", type=float, default=0.75)
-    parser.add_argument("--exit-on-filter-fail", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--filter-fail-exit-bars", type=int, default=3)
+    parser.add_argument("--stop-loss-pct", type=float, default=None)
+    parser.add_argument("--take-profit-pct", type=float, default=None)
+    parser.add_argument("--exit-on-filter-fail", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--filter-fail-exit-bars", type=int, default=None)
     parser.add_argument("--switch-target", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--close-on-exit", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--policy-json", type=Path, default=None)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--checkpoint",
@@ -266,6 +302,19 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     _, symbols, base_open, base_close, base_volume = read_intraday_matrix(args.dataset_dir, args.interval)
+    policy = load_policy(args.policy_json)
+    trade_mode = args.mode or str(policy.get("mode", "long_short"))
+    stop_loss_pct = args.stop_loss_pct if args.stop_loss_pct is not None else policy.get("stop_loss_pct", 0.75)
+    take_profit_pct = args.take_profit_pct if args.take_profit_pct is not None else policy.get("take_profit_pct", 0.75)
+    policy_filter_fail_exit_bars = policy.get("filter_fail_exit_bars") if "filter_fail_exit_bars" in policy else None
+    filter_fail_exit_bars = (
+        args.filter_fail_exit_bars
+        if args.filter_fail_exit_bars is not None
+        else policy_filter_fail_exit_bars
+    )
+    exit_on_filter_fail = (
+        args.exit_on_filter_fail if args.exit_on_filter_fail is not None else filter_fail_exit_bars is not None
+    )
     initial_matrices = build_matrices(base_open, base_close, base_volume, horizon=12)
     device = torch.device(args.device if torch.cuda.is_available() or not args.device.startswith("cuda") else "cpu")
     models = load_models(args.checkpoint, initial_matrices["features"].shape[-1], len(symbols), device)
@@ -280,7 +329,7 @@ def main() -> None:
     rows = []
     start_time = time.time()
     end_time = start_time + args.duration_minutes * 60.0
-    effective_gross = min(float(args.max_gross), float(FINAL_POLICY["gross"]))
+    effective_gross = float(policy["gross"]) if args.max_gross is None else min(float(args.max_gross), float(policy["gross"]))
     required_edge_bps = 2.0 * args.cost_bps + args.min_expected_edge_bps
 
     while True:
@@ -301,13 +350,17 @@ def main() -> None:
 
         latest_row = len(close_px.index) - 1
         latest_ts = close_px.index[latest_row]
+        latest_candle_key = str(latest_ts)
+        if state.symbol and state.last_candle != latest_candle_key:
+            state.bars_held += 1
+            state.last_candle = latest_candle_key
         latest_scores = score_latest(models, matrices["features"][latest_row], device)
         tradable = matrices["tradable"][latest_row] & np.isfinite(latest_scores)
         market_mom_24 = float(market_features["market_mom_24"][latest_row])
         market_mom_96 = float(market_features["market_mom_96"][latest_row])
         filter_pass = (
-            market_mom_24 <= FINAL_POLICY["market_mom_24_max"]
-            and market_mom_96 <= FINAL_POLICY["market_mom_96_max"]
+            market_mom_24 <= policy["market_mom_24_max"]
+            and market_mom_96 <= policy["market_mom_96_max"]
         )
 
         candle_prices = close_px.iloc[latest_row].to_dict()
@@ -318,10 +371,11 @@ def main() -> None:
             latest_scores,
             tradable,
             prices,
-            mode=args.mode,
+            mode=trade_mode,
             gross=effective_gross,
             confidence_to_bps=args.confidence_to_bps,
             required_edge_bps=required_edge_bps,
+            min_confidence=float(policy.get("confidence_min", 0.0)),
             filter_pass=filter_pass,
         )
         if candidate.reason in BLOCKING_CANDIDATE_REASONS:
@@ -330,17 +384,18 @@ def main() -> None:
             filter_fail_count = 0
 
         equity_before, mark_price_before = mark_equity(cash, state, prices)
+        allow_target_switch = args.switch_target and state.bars_held >= int(policy.get("rebalance_every", 1))
         action, target_symbol, target_weight = decide_action(
             state,
             candidate,
             equity_before,
             mark_price_before,
-            stop_loss_pct=args.stop_loss_pct,
-            take_profit_pct=args.take_profit_pct,
-            exit_on_filter_fail=args.exit_on_filter_fail,
+            stop_loss_pct=stop_loss_pct,
+            take_profit_pct=take_profit_pct,
+            exit_on_filter_fail=exit_on_filter_fail,
             filter_fail_count=filter_fail_count,
-            filter_fail_exit_bars=args.filter_fail_exit_bars,
-            switch_target=args.switch_target,
+            filter_fail_exit_bars=filter_fail_exit_bars,
+            switch_target=allow_target_switch,
         )
 
         previous_symbol = state.symbol
@@ -363,6 +418,8 @@ def main() -> None:
                 state.entry_equity = mark_equity(cash, state, prices)[0]
                 state.entry_time = now.isoformat(timespec="seconds")
                 state.opened_by = action
+                state.bars_held = 0
+                state.last_candle = latest_candle_key
             if state.symbol is None:
                 state = PositionState()
 
@@ -390,6 +447,9 @@ def main() -> None:
             "candidate_reason": candidate.reason,
             "filter_pass": filter_pass,
             "filter_fail_count": filter_fail_count,
+            "policy_confidence_min": float(policy.get("confidence_min", 0.0)),
+            "policy_rebalance_every": int(policy.get("rebalance_every", 1)),
+            "position_bars_held": state.bars_held if state.symbol else 0,
             "market_mom_24": market_mom_24,
             "market_mom_96": market_mom_96,
             "trade_cost": cost,
@@ -447,6 +507,9 @@ def main() -> None:
                 "candidate_reason": candidate.reason,
                 "filter_pass": filter_pass,
                 "filter_fail_count": filter_fail_count,
+                "policy_confidence_min": float(policy.get("confidence_min", 0.0)),
+                "policy_rebalance_every": int(policy.get("rebalance_every", 1)),
+                "position_bars_held": 0,
                 "market_mom_24": market_mom_24,
                 "market_mom_96": market_mom_96,
                 "trade_cost": final_close_cost,
@@ -474,17 +537,19 @@ def main() -> None:
         "log_rows": len(rows),
         "output_dir": str(args.output_dir),
         "execution_config": {
-            "mode": args.mode,
+            "mode": trade_mode,
             "max_gross": effective_gross,
             "required_edge_bps": required_edge_bps,
-            "stop_loss_pct": args.stop_loss_pct,
-            "take_profit_pct": args.take_profit_pct,
-            "exit_on_filter_fail": args.exit_on_filter_fail,
-            "filter_fail_exit_bars": args.filter_fail_exit_bars,
+            "stop_loss_pct": stop_loss_pct,
+            "take_profit_pct": take_profit_pct,
+            "exit_on_filter_fail": exit_on_filter_fail,
+            "filter_fail_exit_bars": filter_fail_exit_bars,
             "switch_target": args.switch_target,
             "close_on_exit": args.close_on_exit,
+            "policy_json": str(args.policy_json) if args.policy_json else None,
         },
         "base_policy": FINAL_POLICY,
+        "active_policy": policy,
     }
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     print(

@@ -1,0 +1,2 @@
+split,initial_cash,final_equity,pnl,return_pct,max_drawdown_pct,sharpe_like,bars,active_rate,avg_turnover_per_bar,total_turnover,mean_gross_exposure,stop_exits,take_profit_exits,filter_exits
+validation,10000.0,12440.088671900536,2440.0886719005357,24.400886719005356,-5.490493875796798,5.962854054790339,1083,0.5761772853185596,0.06925207756232687,75.0,0.8642659279778393,0,0,0
