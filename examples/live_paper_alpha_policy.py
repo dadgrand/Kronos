@@ -185,6 +185,33 @@ def fast_worst_segment_return(equity_curve: np.ndarray, initial_cash: float, seg
     return worst
 
 
+def current_alpha_score_vector(close_px: pd.DataFrame, alpha_name: str, normalize: str) -> np.ndarray:
+    kind, lag_text = alpha_name.rsplit("_", 1)
+    lag = int(lag_text)
+    close_ff = close_px.ffill(limit=200)
+    current = close_ff.iloc[-1]
+    lagged = close_ff.shift(lag).iloc[-1]
+    mom = current / lagged - 1.0
+    ret = close_ff.pct_change(fill_method=None)
+    vol = ret.shift(1).rolling(48, min_periods=12).std().iloc[-1].replace(0.0, np.nan)
+    raw_by_kind = {
+        "mom": mom,
+        "rev": -mom,
+        "voladj_mom": mom / vol,
+        "voladj_rev": -mom / vol,
+    }
+    if kind not in raw_by_kind:
+        raise ValueError(f"unknown alpha kind={kind}; parsed from {alpha_name}")
+    score = raw_by_kind[kind].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    if normalize == "cs_zscore":
+        mean = float(score.mean())
+        std = float(score.std())
+        score = (score - mean) / max(std, 1e-6)
+    elif normalize != "none":
+        raise ValueError(f"unknown normalize={normalize}")
+    return score.to_numpy(dtype=np.float32)
+
+
 def fetch_symbol_candles(symbol: str, board: str, interval: int, from_date: str, till_date: str) -> pd.DataFrame:
     session = requests.Session()
     session.trust_env = False
@@ -229,6 +256,120 @@ def fetch_live_candles(
         "fetch_rows": int(len(live)),
     }
     return live, errors, stats
+
+
+def parse_marketdata_timestamp(value: object, reference: pd.Timestamp) -> pd.Timestamp | None:
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if " " in text or "-" in text:
+        timestamp = pd.to_datetime(text, errors="coerce")
+    else:
+        timestamp = pd.to_datetime(f"{reference.date()} {text}", errors="coerce")
+    if pd.isna(timestamp):
+        return None
+    timestamp = pd.Timestamp(timestamp)
+    if timestamp > reference + pd.Timedelta(minutes=1):
+        timestamp -= pd.Timedelta(days=1)
+    return timestamp
+
+
+def marketdata_update_timestamp(row: dict, reference: pd.Timestamp) -> pd.Timestamp | None:
+    system_time = parse_marketdata_timestamp(row.get("system_time"), reference) or reference
+    for key in ["update_time", "time"]:
+        timestamp = parse_marketdata_timestamp(row.get(key), system_time)
+        if timestamp is not None:
+            return timestamp
+    return None
+
+
+def append_marketdata_signal_bar(
+    open_px: pd.DataFrame,
+    close_px: pd.DataFrame,
+    volume: pd.DataFrame,
+    marketdata: dict[str, dict],
+    *,
+    now: dt.datetime,
+    interval: int,
+    min_coverage: float,
+    max_age_minutes: float | None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+    symbols = list(close_px.columns)
+    reference = pd.Timestamp(now)
+    raw_prices = 0
+    live_prices = {}
+    price_ages = []
+    stale_prices = 0
+    missing_update_times = 0
+    for symbol in symbols:
+        row = marketdata.get(symbol, {})
+        price = finite_price(row.get("price"))
+        if price is None:
+            continue
+        raw_prices += 1
+        update_ts = marketdata_update_timestamp(row, reference)
+        if update_ts is None:
+            missing_update_times += 1
+            continue
+        age_minutes = (reference - update_ts).total_seconds() / 60.0
+        if age_minutes < -1.0:
+            stale_prices += 1
+            continue
+        if max_age_minutes is not None and age_minutes > float(max_age_minutes):
+            stale_prices += 1
+            continue
+        live_prices[symbol] = price
+        price_ages.append(max(0.0, age_minutes))
+    coverage = len(live_prices) / max(1, len(symbols))
+    raw_coverage = raw_prices / max(1, len(symbols))
+    stats = {
+        "marketdata_signal_bar_used": False,
+        "marketdata_signal_coverage": coverage,
+        "marketdata_signal_raw_coverage": raw_coverage,
+        "marketdata_signal_prices": len(live_prices),
+        "marketdata_signal_symbols": ",".join(sorted(live_prices)),
+        "marketdata_signal_raw_prices": raw_prices,
+        "marketdata_signal_stale_prices": stale_prices,
+        "marketdata_signal_missing_update_times": missing_update_times,
+        "marketdata_signal_max_age_minutes": max_age_minutes,
+        "marketdata_signal_mean_price_age_minutes": float(np.mean(price_ages)) if price_ages else None,
+        "marketdata_signal_worst_price_age_minutes": float(np.max(price_ages)) if price_ages else None,
+        "marketdata_signal_timestamp": None,
+    }
+    if coverage < min_coverage or not live_prices:
+        return open_px, close_px, volume, stats
+
+    timestamp = pd.Timestamp(now).floor(f"{int(interval)}min")
+    previous_close = close_px.ffill(limit=200).iloc[-1].reindex(symbols)
+    open_row = previous_close.copy()
+    close_row = previous_close.copy()
+    volume_row = pd.Series(0.0, index=symbols, dtype=np.float64)
+    for symbol, price in live_prices.items():
+        close_row.loc[symbol] = price
+        volume_row.loc[symbol] = 1.0
+
+    open_px = open_px.copy()
+    close_px = close_px.copy()
+    volume = volume.copy()
+    open_px.loc[timestamp, symbols] = open_row
+    close_px.loc[timestamp, symbols] = close_row
+    volume.loc[timestamp, symbols] = volume_row
+    open_px = open_px.sort_index()
+    close_px = close_px.sort_index()
+    volume = volume.sort_index()
+    open_px = open_px[~open_px.index.duplicated(keep="last")]
+    close_px = close_px[~close_px.index.duplicated(keep="last")]
+    volume = volume[~volume.index.duplicated(keep="last")]
+    stats.update(
+        {
+            "marketdata_signal_bar_used": True,
+            "marketdata_signal_timestamp": str(timestamp),
+            "marketdata_signal_symbols": ",".join(sorted(live_prices)),
+        }
+    )
+    return open_px, close_px, volume, stats
 
 
 def mark_portfolio(cash: float, positions: dict[str, float], prices: dict[str, float]) -> tuple[float, dict[str, float]]:
@@ -510,6 +651,7 @@ def build_candidate_log_rows(
     target_weights: dict[str, float],
     selected: dict | None,
     best_any: dict | None,
+    live_gate_reason: str,
     top_n: int,
 ) -> list[dict]:
     valid = np.isfinite(scores) & tradable & np.array([symbol in prices for symbol in symbols], dtype=bool)
@@ -526,7 +668,12 @@ def build_candidate_log_rows(
 
     rows = []
     selected_symbols = set(target_weights)
-    reason = "validation_gate_passed" if selected is not None else "validation_gate_blocked"
+    if selected is not None:
+        reason = "validation_gate_passed"
+    elif live_gate_reason:
+        reason = f"live_gate_blocked:{live_gate_reason}"
+    else:
+        reason = "validation_gate_blocked"
     source = selected or best_any or {}
     for idx, symbol in enumerate(symbols):
         if top_n > 0:
@@ -583,6 +730,10 @@ def main() -> None:
     parser.add_argument("--rebalance-on-target-change", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--target-change-tolerance", type=float, default=None)
     parser.add_argument("--max-session-loss-pct", type=float, default=None)
+    parser.add_argument("--max-signal-age-minutes", type=float, default=None)
+    parser.add_argument("--use-marketdata-signal-bar", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--marketdata-signal-min-coverage", type=float, default=None)
+    parser.add_argument("--marketdata-signal-max-age-minutes", type=float, default=None)
     parser.add_argument("--close-on-exit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -613,6 +764,34 @@ def main() -> None:
             else float(config.get("live_max_session_loss_pct"))
         )
     )
+    max_signal_age_minutes = (
+        float(args.max_signal_age_minutes)
+        if args.max_signal_age_minutes is not None
+        else (
+            None
+            if config.get("live_max_signal_age_minutes") is None
+            else float(config.get("live_max_signal_age_minutes"))
+        )
+    )
+    use_marketdata_signal_bar = (
+        bool(args.use_marketdata_signal_bar)
+        if args.use_marketdata_signal_bar is not None
+        else bool(config.get("live_use_marketdata_signal_bar", False))
+    )
+    marketdata_signal_min_coverage = (
+        float(args.marketdata_signal_min_coverage)
+        if args.marketdata_signal_min_coverage is not None
+        else float(config.get("live_marketdata_signal_min_coverage", 0.8))
+    )
+    marketdata_signal_max_age_minutes = (
+        float(args.marketdata_signal_max_age_minutes)
+        if args.marketdata_signal_max_age_minutes is not None
+        else (
+            None
+            if config.get("live_marketdata_signal_max_age_minutes") is None
+            else float(config.get("live_marketdata_signal_max_age_minutes"))
+        )
+    )
 
     _, symbols, base_open, base_close, base_volume = read_intraday_matrix(Path(config["dataset_dir"]), int(config["interval"]))
     session = requests.Session()
@@ -635,6 +814,7 @@ def main() -> None:
     total_turnover = 0.0
     last_rebalance_row: int | None = None
     active_target_weights: dict[str, float] = {}
+    session_stopped = False
     cached_decision_candle: pd.Timestamp | None = None
     cached_alpha_scores: dict[str, np.ndarray] | None = None
     cached_selected: dict | None = None
@@ -659,11 +839,31 @@ def main() -> None:
             workers=max(1, args.fetch_workers),
         )
         open_px, close_px, volume = append_live_to_matrix(base_open, base_close, base_volume, live)
+        marketdata = fetch_marketdata(session, args.board, symbols)
+        wall_time_dt = dt.datetime.now()
+        signal_bar_stats = {
+            "marketdata_signal_bar_used": False,
+            "marketdata_signal_coverage": 0.0,
+            "marketdata_signal_prices": 0,
+            "marketdata_signal_timestamp": None,
+        }
+        if use_marketdata_signal_bar:
+            open_px, close_px, volume, signal_bar_stats = append_marketdata_signal_bar(
+                open_px,
+                close_px,
+                volume,
+                marketdata,
+                now=wall_time_dt,
+                interval=int(config["interval"]),
+                min_coverage=marketdata_signal_min_coverage,
+                max_age_minutes=marketdata_signal_max_age_minutes,
+            )
         matrices = build_matrices(open_px, close_px, volume, int(config["horizon"]))
         market_features = compute_market_features(close_px.index, list(close_px.columns), matrices["bar_return"])
 
         latest_row = len(close_px.index) - 1
         latest_ts = pd.Timestamp(close_px.index[latest_row])
+        signal_source = "marketdata_bar" if signal_bar_stats["marketdata_signal_bar_used"] else "candle"
         validation_end = latest_ts
         validation_start = validation_end - pd.Timedelta(days=int(config["validation_days"]))
         validation_mask = np.asarray((close_px.index >= validation_start) & (close_px.index < validation_end))
@@ -671,7 +871,8 @@ def main() -> None:
 
         decision_started = time.perf_counter()
         decision_cache_hit = (
-            cached_decision_candle is not None
+            signal_source == "candle"
+            and cached_decision_candle is not None
             and latest_ts == cached_decision_candle
             and cached_alpha_scores is not None
             and cached_search_rows is not None
@@ -707,46 +908,113 @@ def main() -> None:
                 config=config,
                 validation_engine=args.validation_engine,
             )
-            cached_decision_candle = latest_ts
-            cached_alpha_scores = alpha_scores
-            cached_selected = selected
-            cached_best_any = best_any
-            cached_search_rows = search_rows
+            if signal_source == "candle":
+                cached_decision_candle = latest_ts
+                cached_alpha_scores = alpha_scores
+                cached_selected = selected
+                cached_best_any = best_any
+                cached_search_rows = search_rows
         decision_elapsed_seconds = time.perf_counter() - decision_started
 
         candle_prices = close_px.iloc[latest_row].to_dict()
-        marketdata = fetch_marketdata(session, args.board, symbols)
         prices = build_live_prices(symbols, candle_prices, marketdata)
+        if signal_source == "marketdata_bar":
+            fresh_symbols = set(str(signal_bar_stats.get("marketdata_signal_symbols") or "").split(","))
+            fresh_symbols.discard("")
+            prices = {symbol: price for symbol, price in prices.items() if symbol in fresh_symbols}
+        signal_start_age_minutes = (pd.Timestamp(wall_time_dt) - latest_ts).total_seconds() / 60.0
+        if signal_source == "marketdata_bar":
+            signal_close_ts = pd.Timestamp(wall_time_dt)
+            signal_age_minutes = 0.0
+        else:
+            signal_close_ts = latest_ts + pd.Timedelta(minutes=int(config["interval"]))
+            signal_age_minutes = (pd.Timestamp(wall_time_dt) - signal_close_ts).total_seconds() / 60.0
+            signal_age_minutes = max(0.0, signal_age_minutes)
+        stale_signal_hit = (
+            max_signal_age_minutes is not None
+            and signal_age_minutes > float(max_signal_age_minutes)
+        )
 
         target_weights = {}
+        raw_selected = selected
+        live_score_uses_marketdata = False
+        live_gate_reasons = []
+        if stale_signal_hit:
+            live_gate_reasons.append("stale_signal")
+        if session_stopped:
+            live_gate_reasons.append("session_loss_stopped")
+        live_gate_reason = ",".join(live_gate_reasons)
+        if live_gate_reasons:
+            selected = None
         score_source = selected or best_any
+        selected_scores_for_execution = None
         if selected is not None:
             selected_policy = selected["policy"]
             selected_scores = alpha_scores[selected["alpha_name"]]
+            if signal_source == "marketdata_bar":
+                selected_scores = selected_scores.copy()
+                selected_scores[latest_row] = current_alpha_score_vector(
+                    close_px,
+                    selected["alpha_name"],
+                    config["alpha_normalize"],
+                )
+                live_score_uses_marketdata = True
+            selected_scores_for_execution = selected_scores
+            execution_tradable = matrices["tradable"] & np.isfinite(selected_scores_for_execution)
+            if signal_source == "marketdata_bar":
+                fresh_mask = np.array([symbol in prices for symbol in symbols], dtype=bool)
+                execution_tradable = execution_tradable.copy()
+                execution_tradable[latest_row] &= fresh_mask
             target_weights = target_weights_from_policy(
                 symbols=symbols,
-                scores=selected_scores,
-                tradable=matrices["tradable"] & np.isfinite(selected_scores),
+                scores=selected_scores_for_execution,
+                tradable=execution_tradable,
                 prices=prices,
                 latest_row=latest_row,
                 policy=selected_policy,
             )
         pre_trade_equity, _ = mark_portfolio(cash, positions, prices)
         session_return_pct = (pre_trade_equity / float(config["initial_cash"]) - 1.0) * 100.0
-        risk_action = ""
+        risk_reasons = []
+        if stale_signal_hit:
+            risk_reasons.append("stale_signal")
+        if session_stopped:
+            risk_reasons.append("session_loss_stopped")
         session_loss_stop_hit = (
             max_session_loss_pct is not None
+            and not session_stopped
             and bool(positions)
             and session_return_pct <= -abs(max_session_loss_pct)
         )
         if session_loss_stop_hit:
             target_weights = {}
-            risk_action = "session_loss_stop"
-        selected_scores_for_log = (
-            alpha_scores[score_source["alpha_name"]]
-            if score_source is not None
-            else np.zeros_like(matrices["bar_return"], dtype=np.float32)
-        )
+            session_stopped = True
+            selected = None
+            live_gate_reasons.append("session_loss_stop")
+            live_gate_reason = ",".join(live_gate_reasons)
+            risk_reasons.append("session_loss_stop")
+        risk_action = ",".join(risk_reasons)
+        if score_source is None:
+            selected_scores_for_log = np.zeros_like(matrices["bar_return"], dtype=np.float32)
+        elif (
+            selected is not None
+            and selected_scores_for_execution is not None
+            and score_source["alpha_name"] == selected["alpha_name"]
+        ):
+            selected_scores_for_log = selected_scores_for_execution
+        else:
+            selected_scores_for_log = alpha_scores[score_source["alpha_name"]]
+            if signal_source == "marketdata_bar":
+                selected_scores_for_log = selected_scores_for_log.copy()
+                selected_scores_for_log[latest_row] = current_alpha_score_vector(
+                    close_px,
+                    score_source["alpha_name"],
+                    config["alpha_normalize"],
+                )
+                live_score_uses_marketdata = True
+        log_tradable_latest = matrices["tradable"][latest_row] & np.isfinite(selected_scores_for_log[latest_row])
+        if signal_source == "marketdata_bar":
+            log_tradable_latest = log_tradable_latest & np.array([symbol in prices for symbol in symbols], dtype=bool)
 
         target_change_rebalance = (
             rebalance_on_target_change
@@ -779,13 +1047,17 @@ def main() -> None:
             active_target_weights = dict(target_weights)
             if session_loss_stop_hit:
                 action = "close_session_loss"
+            elif session_stopped:
+                action = "session_loss_stopped_cash"
+            elif stale_signal_hit:
+                action = "close_stale_signal" if trades else "stale_signal_cash"
             elif target_change_rebalance:
                 action = "rebalance_target_change" if trades else "target_change_no_trade"
             else:
                 action = "rebalance" if trades else ("cash" if not target_weights else "no_trade")
 
         equity, position_values = mark_portfolio(cash, positions, prices)
-        wall_time = now.isoformat(timespec="seconds")
+        wall_time = wall_time_dt.isoformat(timespec="seconds")
         target_symbols = ",".join(sorted(target_weights))
         position_symbols = ",".join(sorted(positions))
         candidate_rows.extend(
@@ -794,13 +1066,14 @@ def main() -> None:
                 latest_candle=str(latest_ts),
                 symbols=symbols,
                 scores=selected_scores_for_log[latest_row],
-                tradable=matrices["tradable"][latest_row] & np.isfinite(selected_scores_for_log[latest_row]),
+                tradable=log_tradable_latest,
                 prices=prices,
                 candle_prices=candle_prices,
                 marketdata=marketdata,
                 target_weights=target_weights,
                 selected=selected,
                 best_any=best_any,
+                live_gate_reason=live_gate_reason if raw_selected is not None else "",
                 top_n=args.candidate_log_top_n,
             )
         )
@@ -825,6 +1098,15 @@ def main() -> None:
                 "selected_k": selected.get("k") if selected else None,
                 "selected_gross": selected.get("gross") if selected else None,
                 "selected_rebalance_every": selected.get("rebalance_every") if selected else None,
+                "raw_selected_alpha": raw_selected.get("alpha_name") if raw_selected else None,
+                "raw_selected_mode": raw_selected.get("mode") if raw_selected else None,
+                "raw_selected_k": raw_selected.get("k") if raw_selected else None,
+                "raw_selected_gross": raw_selected.get("gross") if raw_selected else None,
+                "raw_selected_rebalance_every": raw_selected.get("rebalance_every") if raw_selected else None,
+                "raw_validation_return_pct": raw_selected.get("validation_return_pct") if raw_selected else None,
+                "raw_worst_validation_segment_return_pct": (
+                    raw_selected.get("worst_validation_segment_return_pct") if raw_selected else None
+                ),
                 "validation_return_pct": selected.get("validation_return_pct") if selected else None,
                 "worst_validation_segment_return_pct": (
                     selected.get("worst_validation_segment_return_pct") if selected else None
@@ -844,6 +1126,19 @@ def main() -> None:
                 "target_change_rebalance": target_change_rebalance,
                 "target_change_tolerance": target_change_tolerance,
                 "max_session_loss_pct": max_session_loss_pct,
+                "max_signal_age_minutes": max_signal_age_minutes,
+                "signal_source": signal_source,
+                "live_score_uses_marketdata": live_score_uses_marketdata,
+                "signal_start_age_minutes": signal_start_age_minutes,
+                "signal_age_minutes": signal_age_minutes,
+                "signal_close": str(signal_close_ts),
+                "use_marketdata_signal_bar": use_marketdata_signal_bar,
+                "marketdata_signal_min_coverage": marketdata_signal_min_coverage,
+                "marketdata_signal_max_age_minutes": marketdata_signal_max_age_minutes,
+                **signal_bar_stats,
+                "stale_signal_hit": stale_signal_hit,
+                "session_stopped": session_stopped,
+                "live_gate_reason": live_gate_reason,
                 "session_loss_stop_hit": session_loss_stop_hit,
                 "risk_action": risk_action,
                 "pre_trade_equity": pre_trade_equity,
@@ -878,12 +1173,26 @@ def main() -> None:
             "candidate_log_rows": len(candidate_rows),
             "output_dir": str(args.output_dir),
             "selected": {key: value for key, value in (selected or {}).items() if key != "policy"},
+            "raw_selected": {key: value for key, value in (raw_selected or {}).items() if key != "policy"},
             "best_any": {key: value for key, value in (best_any or {}).items() if key != "policy"},
             "constraints_passed_count": int(sum(bool(row["constraints_ok"]) for row in search_rows)),
             "validation_engine": args.validation_engine,
             "rebalance_on_target_change": rebalance_on_target_change,
             "target_change_tolerance": target_change_tolerance,
             "max_session_loss_pct": max_session_loss_pct,
+            "max_signal_age_minutes": max_signal_age_minutes,
+            "signal_source": signal_source,
+            "live_score_uses_marketdata": live_score_uses_marketdata,
+            "signal_start_age_minutes": signal_start_age_minutes,
+            "signal_age_minutes": signal_age_minutes,
+            "signal_close": str(signal_close_ts),
+            "use_marketdata_signal_bar": use_marketdata_signal_bar,
+            "marketdata_signal_min_coverage": marketdata_signal_min_coverage,
+            "marketdata_signal_max_age_minutes": marketdata_signal_max_age_minutes,
+            **signal_bar_stats,
+            "stale_signal_hit": stale_signal_hit,
+            "session_stopped": session_stopped,
+            "live_gate_reason": live_gate_reason,
             "session_loss_stop_hit": session_loss_stop_hit,
             "risk_action": risk_action,
             "pre_trade_equity": pre_trade_equity,
@@ -900,7 +1209,8 @@ def main() -> None:
         print(
             f"{wall_time} candle={latest_ts} equity={equity:.2f} pnl={summary['pnl']:.2f} "
             f"action={action} selected={summary['selected'].get('alpha_name')} targets={target_symbols or 'cash'} "
-            f"passed={summary['constraints_passed_count']}",
+            f"passed={summary['constraints_passed_count']} signal_age={signal_age_minutes:.1f}m "
+            f"risk={risk_action or 'none'}",
             flush=True,
         )
 
@@ -935,6 +1245,13 @@ def main() -> None:
                 "selected_k": None,
                 "selected_gross": None,
                 "selected_rebalance_every": None,
+                "raw_selected_alpha": None,
+                "raw_selected_mode": None,
+                "raw_selected_k": None,
+                "raw_selected_gross": None,
+                "raw_selected_rebalance_every": None,
+                "raw_validation_return_pct": None,
+                "raw_worst_validation_segment_return_pct": None,
                 "validation_return_pct": None,
                 "worst_validation_segment_return_pct": None,
                 "best_blocked_alpha": None,
@@ -947,6 +1264,31 @@ def main() -> None:
                 "trades_json": json.dumps(trades, ensure_ascii=False),
                 "candidate_count": 0,
                 "constraints_passed_count": 0,
+                "validation_engine": args.validation_engine,
+                "rebalance_on_target_change": rebalance_on_target_change,
+                "target_change_rebalance": False,
+                "target_change_tolerance": target_change_tolerance,
+                "max_session_loss_pct": max_session_loss_pct,
+                "max_signal_age_minutes": max_signal_age_minutes,
+                "signal_source": signal_source,
+                "live_score_uses_marketdata": live_score_uses_marketdata,
+                "signal_start_age_minutes": signal_start_age_minutes,
+                "signal_age_minutes": signal_age_minutes,
+                "signal_close": str(signal_close_ts),
+                "use_marketdata_signal_bar": use_marketdata_signal_bar,
+                "marketdata_signal_min_coverage": marketdata_signal_min_coverage,
+                "marketdata_signal_max_age_minutes": marketdata_signal_max_age_minutes,
+                **signal_bar_stats,
+                "stale_signal_hit": stale_signal_hit,
+                "session_stopped": session_stopped,
+                "live_gate_reason": live_gate_reason,
+                "session_loss_stop_hit": session_loss_stop_hit,
+                "risk_action": "final_close",
+                "pre_trade_equity": pre_trade_equity,
+                "pre_trade_return_pct": session_return_pct,
+                "decision_cache_hit": decision_cache_hit,
+                "decision_elapsed_seconds": decision_elapsed_seconds,
+                "poll_elapsed_seconds": None,
                 "errors": "",
             }
         )

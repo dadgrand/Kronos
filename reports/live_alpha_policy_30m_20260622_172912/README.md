@@ -38,6 +38,9 @@ Candidate-log analysis:
 | Final return | -1.85% |
 | Best marked return | 0.48% |
 | Worst marked return | -1.98% |
+| Signal age from candle open | 24.87-34.20 min |
+| Signal age from candle close | 14.87-24.20 min |
+| Average age from candle close | 19.62 min |
 | Rebalance actions | 2 |
 | Hold actions | 20 |
 | Cash actions | 4 |
@@ -68,12 +71,22 @@ selector still liked the same alpha family but reduced the preferred gross from
 cash, and the runner closed the paper book, but most of the loss had already
 appeared.
 
+A more fundamental issue is signal freshness. The runner entered at 17:29:25
+using a latest signal candle of 17:00:00. Measured from candle close, every poll
+in this run used a signal candle 14.87-24.20 minutes behind wall-clock time. A
+30-minute forward test should not execute intraday trades from candles this
+stale unless the strategy horizon is explicitly designed for that delay.
+
 The next improvement should keep the offline frozen protocol intact while adding
 a live risk overlay:
 
 1. Rebalance when target weights materially change on a new candle.
 2. Close the paper book on a configurable max session loss.
-3. Keep logging both the raw frozen candidate and the live risk-adjusted action.
+3. Build the live signal row from current marketdata when full-enough coverage
+   is available.
+4. Block or close candle-only fallback execution when the latest signal candle is
+   too old.
+5. Keep logging both the raw frozen candidate and the live risk-adjusted action.
 
 This report is not a production proof; it is a useful forward failure that points
 to the next engineering fix.

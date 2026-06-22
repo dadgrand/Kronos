@@ -33,7 +33,11 @@
     "target_return_pct": 10.0,
     "live_rebalance_on_target_change": true,
     "live_target_change_tolerance": 0.05,
-    "live_max_session_loss_pct": 1.0
+    "live_max_session_loss_pct": 1.0,
+    "live_max_signal_age_minutes": 10.0,
+    "live_use_marketdata_signal_bar": true,
+    "live_marketdata_signal_min_coverage": 0.8,
+    "live_marketdata_signal_max_age_minutes": 2.0
   },
-  "notes": "Live risk overlay for forward paper runs. It keeps the strict alpha universe and validation gates, but allows live rebalancing when target weights change materially and closes the paper book if session loss reaches 1%."
+  "notes": "Live risk overlay for forward paper runs. It keeps the strict alpha universe and validation gates, allows live rebalancing when target weights change materially, closes the paper book if session loss reaches 1%, builds the current signal row from live marketdata only when at least 80% of symbols have prices updated within 2 minutes, and blocks candle-only fallback execution when the latest candle is older than one 10-minute bar after close."
 }
