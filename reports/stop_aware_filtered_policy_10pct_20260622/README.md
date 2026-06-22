@@ -70,11 +70,13 @@ The same policy is also saved as `selected_policy.json` for live-paper runs.
 
 Smoke-test output:
 
-- Output dir: `outputs/live_paper_moex_policy_v2_20260622_154608`
+- Output dir: `outputs/live_paper_policy_candidate_log_smoke_20260622`
 - Loaded mode: `short_only`
 - Loaded gross: `1.5` from `selected_policy.json`
 - Loaded confidence gate: `0.035875335335731506`
 - Loaded stop/take: `null` / `null`
+- Candidate log rows: `50`
+- Selected smoke candidate: `PIKK`, short-rank 1
 - One-shot result: 9,970.00 RUB after immediate final close, which is the expected two-sided 1.5x commission cost for a smoke test.
 
 ## Results
@@ -131,3 +133,5 @@ It is not yet a production proof. The policy remains short-only and one-symbol c
 - `selected_validation_bars.csv` and `selected_test_bars.csv`: equity/action traces.
 - `selected_validation_segments.csv` and `selected_test_segments.csv`: chronological segment diagnostics.
 - `cost_sensitivity.csv`: test sensitivity to execution costs.
+
+Forward live-paper runs now also produce `candidate_log.csv`, which records every symbol's score, rank, live/candle price, tradability, and selected-candidate flag at each poll. That file is the required artifact for evaluating target switches and missed alternatives after a live run.

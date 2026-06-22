@@ -12,6 +12,7 @@ It keeps the neural score ensemble from the research pipeline, but changes the l
 - closes any remaining paper position at the end of the run and reports realized final equity;
 - logs every action with candidate, edge estimate, turnover, costs, and equity.
 - can load a frozen research policy with `--policy-json`, including gross, mode, confidence, and market-regime gates.
+- writes `candidate_log.csv` with per-symbol scores, ranks, prices, tradability, and selected-candidate flags for replayable forward analysis.
 
 ## Conservative live paper command
 

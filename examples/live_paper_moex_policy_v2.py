@@ -222,6 +222,75 @@ def build_live_prices(
     return prices
 
 
+def build_candidate_snapshot(
+    *,
+    wall_time: str,
+    latest_candle: str,
+    symbols: list[str],
+    scores: np.ndarray,
+    tradable: np.ndarray,
+    prices: dict[str, float],
+    candle_prices: dict[str, float],
+    marketdata: dict[str, dict],
+    candidate: Candidate,
+    filter_pass: bool,
+    policy: dict,
+    trade_mode: str,
+    top_n: int,
+) -> list[dict]:
+    valid = np.isfinite(scores) & tradable & np.array([symbol in prices for symbol in symbols], dtype=bool)
+    valid_ids = np.flatnonzero(valid)
+    short_rank = np.full(len(symbols), np.nan, dtype=np.float64)
+    long_rank = np.full(len(symbols), np.nan, dtype=np.float64)
+    if valid_ids.size:
+        short_order = valid_ids[np.argsort(scores[valid_ids])]
+        long_order = valid_ids[np.argsort(scores[valid_ids])[::-1]]
+        short_rank[short_order] = np.arange(1, len(short_order) + 1)
+        long_rank[long_order] = np.arange(1, len(long_order) + 1)
+        median_score = float(np.nanmedian(scores[valid_ids]))
+    else:
+        median_score = np.nan
+
+    rows = []
+    for idx, symbol in enumerate(symbols):
+        if top_n > 0:
+            in_top = (
+                (np.isfinite(short_rank[idx]) and short_rank[idx] <= top_n)
+                or (np.isfinite(long_rank[idx]) and long_rank[idx] <= top_n)
+                or symbol == candidate.symbol
+            )
+            if not in_top:
+                continue
+        score = float(scores[idx]) if np.isfinite(scores[idx]) else np.nan
+        md_price = finite_price(marketdata.get(symbol, {}).get("price"))
+        candle_price = finite_price(candle_prices.get(symbol))
+        rows.append(
+            {
+                "wall_time": wall_time,
+                "latest_candle": latest_candle,
+                "symbol": symbol,
+                "score": score,
+                "score_minus_median": score - median_score if np.isfinite(score) and np.isfinite(median_score) else np.nan,
+                "short_rank": short_rank[idx],
+                "long_rank": long_rank[idx],
+                "tradable": bool(tradable[idx]),
+                "has_live_price": symbol in prices,
+                "price": prices.get(symbol),
+                "marketdata_price": md_price,
+                "candle_price": candle_price,
+                "is_selected_candidate": symbol == candidate.symbol,
+                "candidate_reason": candidate.reason,
+                "candidate_weight": candidate.weight if symbol == candidate.symbol else 0.0,
+                "filter_pass": filter_pass,
+                "trade_mode": trade_mode,
+                "policy_gross": float(policy.get("gross", np.nan)),
+                "policy_confidence_min": float(policy.get("confidence_min", 0.0)),
+                "policy_rebalance_every": int(policy.get("rebalance_every", 1)),
+            }
+        )
+    return rows
+
+
 def decide_action(
     state: PositionState,
     candidate: Candidate,
@@ -281,6 +350,7 @@ def main() -> None:
     parser.add_argument("--switch-target", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--close-on-exit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--policy-json", type=Path, default=None)
+    parser.add_argument("--candidate-log-top-n", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--checkpoint",
@@ -327,6 +397,7 @@ def main() -> None:
     total_turnover = 0.0
     filter_fail_count = 0
     rows = []
+    candidate_rows = []
     start_time = time.time()
     end_time = start_time + args.duration_minutes * 60.0
     effective_gross = float(policy["gross"]) if args.max_gross is None else min(float(args.max_gross), float(policy["gross"]))
@@ -382,6 +453,24 @@ def main() -> None:
             filter_fail_count += 1
         else:
             filter_fail_count = 0
+        wall_time = now.isoformat(timespec="seconds")
+        candidate_rows.extend(
+            build_candidate_snapshot(
+                wall_time=wall_time,
+                latest_candle=str(latest_ts),
+                symbols=symbols,
+                scores=latest_scores,
+                tradable=tradable,
+                prices=prices,
+                candle_prices=candle_prices,
+                marketdata=marketdata,
+                candidate=candidate,
+                filter_pass=filter_pass,
+                policy=policy,
+                trade_mode=trade_mode,
+                top_n=args.candidate_log_top_n,
+            )
+        )
 
         equity_before, mark_price_before = mark_equity(cash, state, prices)
         allow_target_switch = args.switch_target and state.bars_held >= int(policy.get("rebalance_every", 1))
@@ -429,7 +518,7 @@ def main() -> None:
             position_return_pct = (equity / state.entry_equity - 1.0) * 100.0
 
         row = {
-            "wall_time": now.isoformat(timespec="seconds"),
+            "wall_time": wall_time,
             "latest_candle": str(latest_ts),
             "cash": cash,
             "position_symbol": state.symbol,
@@ -460,6 +549,7 @@ def main() -> None:
         }
         rows.append(row)
         pd.DataFrame(rows).to_csv(args.output_dir / "live_log.csv", index=False)
+        pd.DataFrame(candidate_rows).to_csv(args.output_dir / "candidate_log.csv", index=False)
 
         if args.once or time.time() >= end_time:
             break
@@ -520,6 +610,7 @@ def main() -> None:
             }
         )
         pd.DataFrame(rows).to_csv(args.output_dir / "live_log.csv", index=False)
+        pd.DataFrame(candidate_rows).to_csv(args.output_dir / "candidate_log.csv", index=False)
 
     summary = {
         "started_at": dt.datetime.fromtimestamp(start_time).isoformat(timespec="seconds"),
@@ -535,6 +626,7 @@ def main() -> None:
         "total_turnover": total_turnover,
         "final_close_cost": final_close_cost,
         "log_rows": len(rows),
+        "candidate_log_rows": len(candidate_rows),
         "output_dir": str(args.output_dir),
         "execution_config": {
             "mode": trade_mode,
@@ -547,6 +639,7 @@ def main() -> None:
             "switch_target": args.switch_target,
             "close_on_exit": args.close_on_exit,
             "policy_json": str(args.policy_json) if args.policy_json else None,
+            "candidate_log_top_n": args.candidate_log_top_n,
         },
         "base_policy": FINAL_POLICY,
         "active_policy": policy,
