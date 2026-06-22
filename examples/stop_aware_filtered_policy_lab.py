@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from diplom_risk_adapter import summarize_diplom_diagnostics
 from filtered_neural_policy_lab import compute_market_features, finite_quantiles
 from neural_policy_lab import build_matrices, read_intraday_matrix, split_masks
 
@@ -162,6 +163,7 @@ def backtest_stop_aware(
     *,
     initial_cash: float,
     cost_bps: float,
+    target_adjuster=None,
 ) -> tuple[dict, pd.DataFrame]:
     bar_return = matrices["bar_return"]
     tradable = matrices["tradable"]
@@ -172,6 +174,7 @@ def backtest_stop_aware(
     filter_fail_count = 0
     cost_rate = cost_bps / 10000.0
     records = []
+    diplom_risk_diags = []
 
     for local_idx, row in enumerate(rows):
         action = "hold"
@@ -187,6 +190,9 @@ def backtest_stop_aware(
             target = np.zeros_like(weights)
             if regime_ok:
                 target = select_target(scores, tradable, row, policy)
+                if target_adjuster is not None:
+                    target, diplom_diag = target_adjuster(target, row)
+                    diplom_risk_diags.append(diplom_diag)
             turnover = float(np.abs(target - weights).sum())
             previous_gross = float(np.abs(weights).sum())
             target_gross = float(np.abs(target).sum())
@@ -264,6 +270,8 @@ def backtest_stop_aware(
             "take_profit_exits": 0,
             "filter_exits": 0,
         }
+        if target_adjuster is not None:
+            summary.update(summarize_diplom_diagnostics(diplom_risk_diags, disabled_reason="no_position"))
         return summary, bars
 
     equity_curve = bars["equity"].to_numpy(dtype=np.float64)
@@ -285,6 +293,8 @@ def backtest_stop_aware(
         "take_profit_exits": int((bars["action"] == "close_take_profit").sum()),
         "filter_exits": int((bars["action"] == "close_filter_fail").sum()),
     }
+    if target_adjuster is not None:
+        summary.update(summarize_diplom_diagnostics(diplom_risk_diags, disabled_reason="no_position"))
     return summary, bars
 
 

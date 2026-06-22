@@ -1,0 +1,2 @@
+window_id,executed,split,period,start_timestamp,end_timestamp,bars,start_equity,end_equity,return_pct,max_drawdown_pct,active_rate,avg_turnover_per_bar,mean_gross_exposure,rebalance_count,stop_exits,take_profit_exits,filter_exits
+1,False,test,2026-05,2026-05-01 09:50:00,2026-05-31 18:50:00,2535,10000.0,7572.567004839442,-24.274329951605576,-27.982987480778977,1.0,0.07159763313609467,1.5,61,0,0,0

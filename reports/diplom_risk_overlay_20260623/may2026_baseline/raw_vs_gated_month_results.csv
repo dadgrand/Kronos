@@ -1,0 +1,2 @@
+test_month,windows,raw_candidate_windows,gated_trade_windows,raw_return_pct,gated_return_pct,raw_win_rate,gated_win_rate,raw_worst_window_return_pct,gated_worst_window_return_pct
+2026-05,1,1,0,-24.274329951605576,0.0,0.0,0.0,-24.274329951605576,0.0

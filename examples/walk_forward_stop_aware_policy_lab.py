@@ -276,7 +276,7 @@ def evaluate_window(
 
 def summarize_compounded(window_results: pd.DataFrame, initial_cash: float, target_return_pct: float) -> dict:
     equity = float(initial_cash)
-    curve = []
+    curve = [equity]
     for _, row in window_results.sort_values("window_id").iterrows():
         equity *= 1.0 + float(row["test_return_pct"]) / 100.0
         curve.append(equity)

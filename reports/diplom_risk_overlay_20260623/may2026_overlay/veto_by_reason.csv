@@ -1,0 +1,3 @@
+reject_reason,windows,raw_profitable_windows,raw_losing_windows,avoided_loss_pct,missed_profit_pct,mean_raw_test_return_pct
+catastrophic_regime_risk,1,0,1,24.274329951605576,0.0,-24.274329951605576
+decision_score,1,0,1,24.274329951605576,0.0,-24.274329951605576

@@ -1,0 +1,2 @@
+window_id,split,period,start_timestamp,end_timestamp,bars,start_equity,end_equity,return_pct,max_drawdown_pct,active_rate,avg_turnover_per_bar,mean_gross_exposure,rebalance_count,stop_exits,take_profit_exits,filter_exits
+1,selection,2026-04,2026-04-01 06:50:00,2026-04-23 23:40:00,2064,10000.0,13069.227376731676,30.692273767316756,-18.245615855235076,1.0,0.07340116279069768,1.5,51,0,0,0

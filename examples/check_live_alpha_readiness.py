@@ -22,7 +22,7 @@ from neural_policy_lab import read_intraday_matrix
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Check whether live alpha policy inputs are fresh enough.")
-    parser.add_argument("--config-json", type=Path, default=Path("configs/strict_alpha_policy_latency_delay3_dd6_20260622.json"))
+    parser.add_argument("--config-json", type=Path, default=Path("configs/strict_nested_edge_policy_20260622.json"))
     parser.add_argument("--board", default="TQBR")
     parser.add_argument("--fetch-days", type=int, default=8)
     parser.add_argument("--fetch-workers", type=int, default=12)

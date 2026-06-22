@@ -13,6 +13,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from diplom_risk_adapter import DiplomRiskAdapter, config_from_mapping, empty_diplom_summary, summarize_diplom_diagnostics
 from filtered_neural_policy_lab import compute_market_features
 from live_paper_moex_policy import append_live_to_matrix, fetch_candles, fetch_marketdata
 from live_paper_moex_policy_v2 import build_live_prices, finite_price
@@ -21,9 +22,18 @@ from stop_aware_filtered_policy_lab import backtest_stop_aware, score_confidence
 from walk_forward_alpha_policy_lab import (
     build_alpha_scores,
     build_candidates,
-    constraints_pass,
+    build_regime_history,
+    build_trade_probability_model,
+    calibration_stats_from_history,
     delay_market_features,
     delay_matrix,
+    gate_trade_passes,
+    make_diplom_target_adjuster,
+    market_regime_profile,
+    mode_default_threshold,
+    score_may_like_regime,
+    selection_allowed_by_mode,
+    split_nested_masks,
     stop_policy,
 )
 from walk_forward_stop_aware_policy_lab import parse_modes
@@ -105,6 +115,7 @@ def fast_backtest_stopless(
     *,
     initial_cash: float,
     cost_bps: float,
+    target_adjuster=None,
 ) -> tuple[dict, np.ndarray]:
     rows = np.flatnonzero(masks[split])
     weights = np.zeros(scores.shape[1], dtype=np.float32)
@@ -116,10 +127,14 @@ def fast_backtest_stopless(
     gross_exposures = np.empty(len(rows), dtype=np.float64)
     bar_return = matrices["bar_return"]
     tradable = matrices["tradable"]
+    diplom_risk_diags = []
 
     for local_idx, row in enumerate(rows):
         if local_idx % policy.rebalance_every == 0:
             target = fast_select_target(scores, tradable, row, policy)
+            if target_adjuster is not None:
+                target, diplom_diag = target_adjuster(target, row)
+                diplom_risk_diags.append(diplom_diag)
             turnover = float(np.abs(target - weights).sum())
             weights = target
         else:
@@ -150,6 +165,8 @@ def fast_backtest_stopless(
             "take_profit_exits": 0,
             "filter_exits": 0,
         }
+        if target_adjuster is not None:
+            summary.update(summarize_diplom_diagnostics(diplom_risk_diags, disabled_reason="no_position"))
         return summary, equity_curve
 
     summary = {
@@ -169,6 +186,8 @@ def fast_backtest_stopless(
         "take_profit_exits": 0,
         "filter_exits": 0,
     }
+    if target_adjuster is not None:
+        summary.update(summarize_diplom_diagnostics(diplom_risk_diags, disabled_reason="no_position"))
     return summary, equity_curve
 
 
@@ -452,176 +471,325 @@ def select_validation_candidate(
     candidates: list,
     config: dict,
     validation_engine: str,
+    regime_risk: float,
+    target_adjuster=None,
 ) -> tuple[dict | None, dict | None, list[dict]]:
     rows = []
     best = None
     best_any = None
-    needs_stress = (
+    decision_mode = str(config.get("decision_mode", "balanced"))
+    decision_score_threshold = mode_default_threshold(decision_mode, config.get("decision_score_threshold"))
+    selection_split = "selection" if "selection" in masks else "validation"
+    gate_split = "gate" if "gate" in masks else selection_split
+    needs_selection_stress = (
         config.get("min_validation_stress_return_pct") is not None
-        or abs(float(config["stress_selection_weight"])) > 0.0
+        or abs(float(config.get("stress_selection_weight", 0.0))) > 0.0
     )
-    needs_segment = (
+    needs_selection_segment = (
         config.get("min_validation_segment_return_pct") is not None
-        or abs(float(config["segment_selection_penalty"])) > 0.0
+        or abs(float(config.get("segment_selection_penalty", 0.0))) > 0.0
     )
     for candidate in candidates:
         scores = alpha_scores[candidate.alpha_name]
         confidence = confidences.get((candidate.alpha_name, candidate.mode))
         policy = stop_policy(candidate)
         if validation_engine == "fast":
-            validation_summary, validation_curve = fast_backtest_stopless(
+            selection_summary, selection_curve = fast_backtest_stopless(
                 scores,
                 matrices,
                 masks,
-                "validation",
+                selection_split,
                 policy,
                 initial_cash=float(config["initial_cash"]),
                 cost_bps=float(config["cost_bps"]),
+                target_adjuster=target_adjuster,
             )
-            validation_bars = None
+            selection_bars = None
         elif validation_engine == "full":
             if confidence is None:
                 raise ValueError(f"missing confidence for {(candidate.alpha_name, candidate.mode)}")
-            validation_summary, validation_bars = backtest_stop_aware(
+            selection_summary, selection_bars = backtest_stop_aware(
                 scores,
                 matrices,
                 masks,
                 market_features,
                 confidence,
-                "validation",
+                selection_split,
                 policy,
                 initial_cash=float(config["initial_cash"]),
                 cost_bps=float(config["cost_bps"]),
+                target_adjuster=target_adjuster,
             )
-            validation_curve = None
+            selection_curve = None
         else:
             raise ValueError(f"unknown validation_engine={validation_engine}")
         raw_score = selection_score(
-            validation_summary,
+            selection_summary,
             float(config["drawdown_penalty"]),
             float(config["turnover_penalty"]),
         )
         preliminary_ok = True
         if config.get("min_validation_return_pct") is not None:
-            preliminary_ok &= float(validation_summary["return_pct"]) >= float(config["min_validation_return_pct"])
+            preliminary_ok &= float(selection_summary["return_pct"]) >= float(config["min_validation_return_pct"])
         if config.get("max_validation_drawdown_pct") is not None:
-            preliminary_ok &= float(validation_summary["max_drawdown_pct"]) >= -abs(
+            preliminary_ok &= float(selection_summary["max_drawdown_pct"]) >= -abs(
                 float(config["max_validation_drawdown_pct"])
             )
 
         worst_segment = None
         segment_ok = preliminary_ok
-        if preliminary_ok and needs_segment:
+        if preliminary_ok and needs_selection_segment:
             if validation_engine == "fast":
                 worst_segment = fast_worst_segment_return(
-                    validation_curve,
+                    selection_curve,
                     float(config["initial_cash"]),
                     int(config["segment_count"]),
                 )
             else:
-                validation_segments = segment_diagnostics(
-                    validation_bars,
-                    split="validation",
+                selection_segments = segment_diagnostics(
+                    selection_bars,
+                    split=selection_split,
                     initial_cash=float(config["initial_cash"]),
                     segment_count=int(config["segment_count"]),
                 )
-                worst_segment = float(validation_segments["return_pct"].min()) if not validation_segments.empty else None
+                worst_segment = float(selection_segments["return_pct"].min()) if not selection_segments.empty else None
             if config.get("min_validation_segment_return_pct") is not None:
                 segment_ok &= worst_segment is not None and worst_segment >= float(
                     config["min_validation_segment_return_pct"]
                 )
 
-        validation_stress_summary = {"return_pct": np.nan, "max_drawdown_pct": np.nan}
+        selection_stress_summary = {"return_pct": np.nan, "max_drawdown_pct": np.nan}
         stress_ok = preliminary_ok and segment_ok
-        if preliminary_ok and segment_ok and needs_stress:
+        if preliminary_ok and segment_ok and needs_selection_stress:
             if validation_engine == "fast":
-                validation_stress_summary, _ = fast_backtest_stopless(
+                selection_stress_summary, _ = fast_backtest_stopless(
                     scores,
                     matrices,
                     masks,
-                    "validation",
+                    selection_split,
                     policy,
                     initial_cash=float(config["initial_cash"]),
                     cost_bps=float(config["stress_cost_bps"]),
+                    target_adjuster=target_adjuster,
                 )
             else:
                 if confidence is None:
                     raise ValueError(f"missing confidence for {(candidate.alpha_name, candidate.mode)}")
-                validation_stress_summary, _ = backtest_stop_aware(
+                selection_stress_summary, _ = backtest_stop_aware(
                     scores,
                     matrices,
                     masks,
                     market_features,
                     confidence,
-                    "validation",
+                    selection_split,
                     policy,
                     initial_cash=float(config["initial_cash"]),
                     cost_bps=float(config["stress_cost_bps"]),
+                    target_adjuster=target_adjuster,
                 )
             if config.get("min_validation_stress_return_pct") is not None:
-                stress_ok &= float(validation_stress_summary["return_pct"]) >= float(
+                stress_ok &= float(selection_stress_summary["return_pct"]) >= float(
                     config["min_validation_stress_return_pct"]
                 )
 
         stress_component = (
-            float(config["stress_selection_weight"]) * float(validation_stress_summary["return_pct"])
-            if needs_stress
+            float(config.get("stress_selection_weight", 0.0)) * float(selection_stress_summary["return_pct"])
+            if needs_selection_stress
             else 0.0
         )
         selection = (
             raw_score
-            + float(config["segment_selection_penalty"]) * float(worst_segment if worst_segment is not None else -999.0)
+            + float(config.get("segment_selection_penalty", 0.0))
+            * float(worst_segment if worst_segment is not None else -999.0)
             + stress_component
         )
         ok = bool(preliminary_ok and segment_ok and stress_ok)
+        selection_allowed = selection_allowed_by_mode(ok, decision_mode)
         row = {
             **asdict(candidate),
-            "validation_return_pct": validation_summary["return_pct"],
-            "validation_max_drawdown_pct": validation_summary["max_drawdown_pct"],
-            "validation_stress_return_pct": validation_stress_summary["return_pct"],
+            "selection_return_pct": selection_summary["return_pct"],
+            "selection_max_drawdown_pct": selection_summary["max_drawdown_pct"],
+            "selection_stress_return_pct": selection_stress_summary["return_pct"],
+            "validation_return_pct": selection_summary["return_pct"],
+            "validation_max_drawdown_pct": selection_summary["max_drawdown_pct"],
+            "validation_stress_return_pct": selection_stress_summary["return_pct"],
             "worst_validation_segment_return_pct": worst_segment,
+            "worst_selection_segment_return_pct": worst_segment,
             "raw_selection_score": raw_score,
             "constraints_ok": ok,
-            "selection_score": selection if ok else -np.inf,
+            "selection_allowed": selection_allowed,
+            "selection_score": selection if selection_allowed else -np.inf,
         }
         rows.append(row)
+        raw_record = {
+            **row,
+            "raw_candidate_score": selection,
+            "policy": policy,
+            "_scores": scores,
+            "_confidence": confidence,
+            "_selection_summary": selection_summary,
+            "_selection_stress_summary": selection_stress_summary,
+        }
         if best_any is None or selection > best_any["raw_candidate_score"]:
-            best_any = {**row, "raw_candidate_score": selection, "policy": policy}
-        if ok and (best is None or selection > best["selection_score"]):
-            best = {**row, "policy": policy}
-    if not needs_stress:
-        for record in [best, best_any]:
-            if record is None:
-                continue
-            scores = alpha_scores[record["alpha_name"]]
-            confidence = confidences.get((record["alpha_name"], record["mode"]))
-            if validation_engine == "fast":
-                stress_summary, _ = fast_backtest_stopless(
-                    scores,
-                    matrices,
-                    masks,
-                    "validation",
-                    record["policy"],
-                    initial_cash=float(config["initial_cash"]),
-                    cost_bps=float(config["stress_cost_bps"]),
-                )
-            else:
-                if confidence is None:
-                    raise ValueError(f"missing confidence for {(record['alpha_name'], record['mode'])}")
-                stress_summary, _ = backtest_stop_aware(
-                    scores,
-                    matrices,
-                    masks,
-                    market_features,
-                    confidence,
-                    "validation",
-                    record["policy"],
-                    initial_cash=float(config["initial_cash"]),
-                    cost_bps=float(config["stress_cost_bps"]),
-                )
-            record["validation_stress_return_pct"] = stress_summary["return_pct"]
-            record["validation_stress_max_drawdown_pct"] = stress_summary["max_drawdown_pct"]
-    return best, best_any, rows
+            best_any = raw_record
+        if selection_allowed and (best is None or selection > best["selection_score"]):
+            best = raw_record
+
+    if best is None:
+        return None, best_any, rows
+
+    scores = best["_scores"]
+    confidence = best["_confidence"]
+    if validation_engine == "fast":
+        gate_summary, gate_curve = fast_backtest_stopless(
+            scores,
+            matrices,
+            masks,
+            gate_split,
+            best["policy"],
+            initial_cash=float(config["initial_cash"]),
+            cost_bps=float(config["cost_bps"]),
+            target_adjuster=target_adjuster,
+        )
+        gate_stress_summary, _ = fast_backtest_stopless(
+            scores,
+            matrices,
+            masks,
+            gate_split,
+            best["policy"],
+            initial_cash=float(config["initial_cash"]),
+            cost_bps=float(config["stress_cost_bps"]),
+            target_adjuster=target_adjuster,
+        )
+        gate_worst_segment = fast_worst_segment_return(
+            gate_curve,
+            float(config["initial_cash"]),
+            int(config["segment_count"]),
+        )
+    else:
+        if confidence is None:
+            raise ValueError(f"missing confidence for {(best['alpha_name'], best['mode'])}")
+        gate_summary, gate_bars = backtest_stop_aware(
+            scores,
+            matrices,
+            masks,
+            market_features,
+            confidence,
+            gate_split,
+            best["policy"],
+            initial_cash=float(config["initial_cash"]),
+            cost_bps=float(config["cost_bps"]),
+            target_adjuster=target_adjuster,
+        )
+        gate_stress_summary, _ = backtest_stop_aware(
+            scores,
+            matrices,
+            masks,
+            market_features,
+            confidence,
+            gate_split,
+            best["policy"],
+            initial_cash=float(config["initial_cash"]),
+            cost_bps=float(config["stress_cost_bps"]),
+            target_adjuster=target_adjuster,
+        )
+        gate_segments = segment_diagnostics(
+            gate_bars,
+            split=gate_split,
+            initial_cash=float(config["initial_cash"]),
+            segment_count=int(config["segment_count"]),
+        )
+        gate_worst_segment = float(gate_segments["return_pct"].min()) if not gate_segments.empty else None
+
+    selection_periods = pd.DataFrame([{"return_pct": float(best["_selection_summary"]["return_pct"])}])
+    gate_periods = pd.DataFrame([{"return_pct": float(gate_summary["return_pct"])}])
+    calibration_stats = calibration_stats_from_history(
+        [],
+        min_windows=int(config.get("calibration_min_windows", 4)),
+    )
+    trade_model = build_trade_probability_model(
+        selection_summary=best["_selection_summary"],
+        selection_stress_summary=best["_selection_stress_summary"],
+        selection_periods=selection_periods,
+        gate_summary=gate_summary,
+        gate_stress_summary=gate_stress_summary,
+        gate_periods=gate_periods,
+        regime_risk=regime_risk,
+        edge_uncertainty_weight=float(config.get("edge_uncertainty_weight", 1.0)),
+        edge_regime_risk_weight_pct=float(config.get("edge_regime_risk_weight_pct", 5.0)),
+        decision_mode=decision_mode,
+        calibration_stats=calibration_stats,
+        calibration_bias_weight=float(config.get("calibration_bias_weight", 0.5)),
+        neural_feature_weight=float(config.get("neural_feature_weight", 0.0)),
+        neural_uncertainty_weight=float(config.get("neural_uncertainty_weight", 0.5)),
+        neural_uncertainty_pct=0.0,
+        uses_neural_feature=best["alpha_name"] == "neural_ensemble",
+    )
+    trade_model.update(
+        {
+            **empty_diplom_summary(),
+            **{key: value for key, value in gate_summary.items() if key.startswith("diplom_")},
+        }
+    )
+    gate_pass, gate_reasons = gate_trade_passes(
+        trade_model,
+        gate_summary,
+        gate_stress_summary,
+        decision_mode=decision_mode,
+        decision_score_threshold=decision_score_threshold,
+        min_gate_return_pct=None
+        if config.get("min_gate_return_pct") is None
+        else float(config.get("min_gate_return_pct")),
+        min_gate_stress_return_pct=None
+        if config.get("min_gate_stress_return_pct", 0.0) is None
+        else float(config.get("min_gate_stress_return_pct", 0.0)),
+        min_gate_worst_month_return_pct=None
+        if config.get("min_gate_worst_month_return_pct") is None
+        else float(config.get("min_gate_worst_month_return_pct")),
+        min_gate_month_win_rate=None
+        if config.get("min_gate_month_win_rate", 0.5) is None
+        else float(config.get("min_gate_month_win_rate", 0.5)),
+        min_edge_stress_pct=None
+        if config.get("min_edge_stress_pct", 0.0) is None
+        else float(config.get("min_edge_stress_pct", 0.0)),
+        max_regime_risk=None
+        if config.get("max_regime_risk", 0.70) is None
+        else float(config.get("max_regime_risk", 0.70)),
+        regime_veto=bool(config.get("regime_veto", True)),
+    )
+    best.update(
+        {
+            "gate_pass": gate_pass,
+            "gate_reject_reasons": gate_reasons,
+            "gate_return_pct": gate_summary["return_pct"],
+            "gate_max_drawdown_pct": gate_summary["max_drawdown_pct"],
+            "gate_stress_return_pct": gate_stress_summary["return_pct"],
+            "gate_stress_max_drawdown_pct": gate_stress_summary["max_drawdown_pct"],
+            "worst_gate_segment_return_pct": gate_worst_segment,
+            "validation_return_pct": gate_summary["return_pct"],
+            "validation_max_drawdown_pct": gate_summary["max_drawdown_pct"],
+            "validation_stress_return_pct": gate_stress_summary["return_pct"],
+            "worst_validation_segment_return_pct": gate_worst_segment,
+            **trade_model,
+        }
+    )
+    for row in rows:
+        same = all(row.get(key) == best.get(key) for key in ["alpha_name", "mode", "k", "gross", "rebalance_every"])
+        if same:
+            row.update(
+                {
+                    "gate_pass": gate_pass,
+                    "gate_reject_reasons": gate_reasons,
+                    "gate_return_pct": gate_summary["return_pct"],
+                    "gate_stress_return_pct": gate_stress_summary["return_pct"],
+                    "worst_gate_segment_return_pct": gate_worst_segment,
+                    **trade_model,
+                }
+            )
+            break
+
+    clean_best = {key: value for key, value in best.items() if not key.startswith("_")}
+    return (clean_best if gate_pass else None), clean_best, rows
 
 
 def target_weights_from_policy(
@@ -632,12 +800,22 @@ def target_weights_from_policy(
     prices: dict[str, float],
     latest_row: int,
     policy,
-) -> dict[str, float]:
+    diplom_adapter: DiplomRiskAdapter | None = None,
+    decision_time: pd.Timestamp | None = None,
+) -> tuple[dict[str, float], dict]:
     price_mask = np.array([symbol in prices for symbol in symbols], dtype=bool)
     tradable_for_policy = tradable.copy()
     tradable_for_policy[latest_row] &= price_mask
     target = select_target(scores, tradable_for_policy, latest_row, policy)
-    return {symbols[idx]: float(weight) for idx, weight in enumerate(target) if abs(float(weight)) > 1e-12}
+    if diplom_adapter is not None:
+        target, risk_diag = diplom_adapter.apply_to_target(
+            target,
+            symbols=symbols,
+            timestamp=decision_time if decision_time is not None else pd.Timestamp.utcnow(),
+        )
+    else:
+        risk_diag = empty_diplom_summary()
+    return {symbols[idx]: float(weight) for idx, weight in enumerate(target) if abs(float(weight)) > 1e-12}, risk_diag
 
 
 def build_candidate_log_rows(
@@ -655,6 +833,8 @@ def build_candidate_log_rows(
     best_any: dict | None,
     live_gate_reason: str,
     top_n: int,
+    diplom_adapter: DiplomRiskAdapter | None = None,
+    decision_time: pd.Timestamp | None = None,
 ) -> list[dict]:
     valid = np.isfinite(scores) & tradable & np.array([symbol in prices for symbol in symbols], dtype=bool)
     valid_ids = np.flatnonzero(valid)
@@ -689,6 +869,17 @@ def build_candidate_log_rows(
         score = float(scores[idx]) if np.isfinite(scores[idx]) else np.nan
         md_price = finite_price(marketdata.get(symbol, {}).get("price"))
         candle_price = finite_price(candle_prices.get(symbol))
+        diplom_lookup = diplom_adapter.lookup(symbol, decision_time or latest_candle) if diplom_adapter is not None else None
+        diplom_status = diplom_lookup.get("status") if diplom_lookup else None
+        diplom_p_high = diplom_lookup.get("p_high") if diplom_lookup else np.nan
+        diplom_penalty_pct = 0.0
+        if diplom_lookup and diplom_status == "ok" and np.isfinite(float(diplom_p_high)):
+            diplom_penalty_pct = float(diplom_adapter.config.risk_weight_pct) * float(diplom_p_high)
+            if (
+                diplom_adapter.config.long_veto_p_high is not None
+                and float(diplom_p_high) >= float(diplom_adapter.config.long_veto_p_high)
+            ):
+                diplom_penalty_pct = 100.0
         rows.append(
             {
                 "wall_time": wall_time,
@@ -714,6 +905,27 @@ def build_candidate_log_rows(
                 "policy_rebalance_every": source.get("rebalance_every"),
                 "validation_return_pct": source.get("validation_return_pct"),
                 "worst_validation_segment_return_pct": source.get("worst_validation_segment_return_pct"),
+                "gate_pass": source.get("gate_pass"),
+                "gate_reject_reasons": source.get("gate_reject_reasons"),
+                "gate_return_pct": source.get("gate_return_pct"),
+                "gate_stress_return_pct": source.get("gate_stress_return_pct"),
+                "expected_return_pct": source.get("expected_return_pct"),
+                "uncertainty_pct": source.get("uncertainty_pct"),
+                "regime_risk": source.get("regime_risk"),
+                "stress_edge_pct": source.get("stress_edge_pct"),
+                "decision_score": source.get("decision_score"),
+                "soft_risk_flags": source.get("soft_risk_flags"),
+                "trade_probability": source.get("trade_probability"),
+                "diplom_ticker": diplom_lookup.get("diplom_ticker") if diplom_lookup else None,
+                "diplom_prediction_date": (
+                    str(diplom_lookup.get("decision_date")) if diplom_lookup and diplom_lookup.get("decision_date") is not None else None
+                ),
+                "diplom_prediction_age_days": diplom_lookup.get("prediction_age_days") if diplom_lookup else None,
+                "diplom_risk_available": bool(diplom_status == "ok") if diplom_lookup else False,
+                "diplom_risk_class": diplom_lookup.get("risk_class") if diplom_lookup else None,
+                "diplom_p_high": diplom_p_high,
+                "diplom_risk_penalty_pct": diplom_penalty_pct,
+                "diplom_risk_reason": diplom_lookup.get("reason") if diplom_lookup else "diplom_risk_disabled",
             }
         )
     return rows
@@ -721,7 +933,7 @@ def build_candidate_log_rows(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Live paper runner for the frozen strict alpha protocol.")
-    parser.add_argument("--config-json", type=Path, default=Path("configs/strict_alpha_policy_20260622.json"))
+    parser.add_argument("--config-json", type=Path, default=Path("configs/strict_nested_edge_policy_20260622.json"))
     parser.add_argument("--board", default="TQBR")
     parser.add_argument("--duration-minutes", type=float, default=30.0)
     parser.add_argument("--poll-seconds", type=float, default=60.0)
@@ -742,6 +954,8 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_protocol_config(args.config_json)
+    diplom_config = config_from_mapping(config)
+    diplom_adapter = DiplomRiskAdapter.from_config(diplom_config)
     if args.output_dir is None:
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         args.output_dir = Path("outputs") / f"live_paper_alpha_policy_{stamp}"
@@ -870,11 +1084,33 @@ def main() -> None:
 
         latest_row = len(close_px.index) - 1
         latest_ts = pd.Timestamp(close_px.index[latest_row])
+        diplom_target_adjuster = make_diplom_target_adjuster(diplom_adapter, close_px.index, symbols)
         signal_source = "marketdata_bar" if signal_bar_stats["marketdata_signal_bar_used"] else "candle"
         validation_end = latest_ts
         validation_start = validation_end - pd.Timedelta(days=int(config["validation_days"]))
-        validation_mask = np.asarray((close_px.index >= validation_start) & (close_px.index < validation_end))
-        masks = {"validation": validation_mask}
+        masks, nested_spans = split_nested_masks(
+            close_px.index,
+            validation_start=validation_start,
+            validation_end=validation_end,
+            test_start=None,
+            test_end=None,
+            gate_days=int(config.get("nested_gate_days", 7)),
+        )
+        regime_history = build_regime_history(
+            close_px.index,
+            matrices,
+            market_features,
+            end=nested_spans["selection_end"],
+            block_days=int(config.get("regime_block_days", 7)),
+        )
+        gate_regime_profile = market_regime_profile(close_px.index, matrices, market_features, masks["gate"])
+        regime = score_may_like_regime(
+            gate_regime_profile,
+            regime_history,
+            bad_return_quantile=float(config.get("regime_bad_return_quantile", 0.25)),
+            bad_drawdown_quantile=float(config.get("regime_bad_drawdown_quantile", 0.25)),
+            min_history_windows=int(config.get("min_regime_history_windows", 4)),
+        )
 
         decision_started = time.perf_counter()
         decision_cache_hit = (
@@ -919,6 +1155,8 @@ def main() -> None:
                 candidates=candidates,
                 config=config,
                 validation_engine=args.validation_engine,
+                regime_risk=float(regime["regime_risk"]),
+                target_adjuster=diplom_target_adjuster,
             )
             if signal_source == "candle":
                 cached_decision_candle = latest_ts
@@ -948,7 +1186,7 @@ def main() -> None:
         )
 
         target_weights = {}
-        raw_selected = selected
+        raw_selected = selected or best_any
         live_score_uses_marketdata = False
         live_gate_reasons = []
         if stale_signal_hit:
@@ -960,10 +1198,11 @@ def main() -> None:
             selected = None
         score_source = selected or best_any
         selected_scores_for_execution = None
+        target_risk_diag = empty_diplom_summary("no_selected_policy")
         if selected is not None:
             selected_policy = selected["policy"]
             selected_scores = alpha_scores[selected["alpha_name"]]
-            if signal_source == "marketdata_bar" and signal_delay_bars == 0:
+            if signal_source == "marketdata_bar" and signal_delay_bars == 0 and selected["alpha_name"] != "neural_ensemble":
                 selected_scores = selected_scores.copy()
                 selected_scores[latest_row] = current_alpha_score_vector(
                     close_px,
@@ -977,13 +1216,15 @@ def main() -> None:
                 fresh_mask = np.array([symbol in prices for symbol in symbols], dtype=bool)
                 execution_tradable = execution_tradable.copy()
                 execution_tradable[latest_row] &= fresh_mask
-            target_weights = target_weights_from_policy(
+            target_weights, target_risk_diag = target_weights_from_policy(
                 symbols=symbols,
                 scores=selected_scores_for_execution,
                 tradable=execution_tradable,
                 prices=prices,
                 latest_row=latest_row,
                 policy=selected_policy,
+                diplom_adapter=diplom_adapter,
+                decision_time=latest_ts,
             )
         pre_trade_equity, _ = mark_portfolio(cash, positions, prices)
         session_return_pct = (pre_trade_equity / float(config["initial_cash"]) - 1.0) * 100.0
@@ -1016,7 +1257,7 @@ def main() -> None:
             selected_scores_for_log = selected_scores_for_execution
         else:
             selected_scores_for_log = alpha_scores[score_source["alpha_name"]]
-            if signal_source == "marketdata_bar" and signal_delay_bars == 0:
+            if signal_source == "marketdata_bar" and signal_delay_bars == 0 and score_source["alpha_name"] != "neural_ensemble":
                 selected_scores_for_log = selected_scores_for_log.copy()
                 selected_scores_for_log[latest_row] = current_alpha_score_vector(
                     close_px,
@@ -1087,6 +1328,8 @@ def main() -> None:
                 best_any=best_any,
                 live_gate_reason=live_gate_reason if raw_selected is not None else "",
                 top_n=args.candidate_log_top_n,
+                diplom_adapter=diplom_adapter,
+                decision_time=latest_ts,
             )
         )
         live_rows.append(
@@ -1095,6 +1338,10 @@ def main() -> None:
                 "latest_candle": str(latest_ts),
                 "validation_start": str(validation_start),
                 "validation_end": str(validation_end),
+                "selection_start": str(nested_spans["selection_start"]),
+                "selection_end": str(nested_spans["selection_end"]),
+                "gate_start": str(nested_spans["gate_start"]),
+                "gate_end": str(nested_spans["gate_end"]),
                 "action": action,
                 "cash": cash,
                 "equity": equity,
@@ -1119,10 +1366,35 @@ def main() -> None:
                 "raw_worst_validation_segment_return_pct": (
                     raw_selected.get("worst_validation_segment_return_pct") if raw_selected else None
                 ),
+                "raw_gate_pass": raw_selected.get("gate_pass") if raw_selected else None,
+                "raw_gate_reject_reasons": raw_selected.get("gate_reject_reasons") if raw_selected else None,
+                "raw_expected_return_pct": raw_selected.get("expected_return_pct") if raw_selected else None,
+                "raw_uncertainty_pct": raw_selected.get("uncertainty_pct") if raw_selected else None,
+                "raw_regime_risk": raw_selected.get("regime_risk") if raw_selected else None,
+                "raw_stress_edge_pct": raw_selected.get("stress_edge_pct") if raw_selected else None,
+                "raw_decision_score": raw_selected.get("decision_score") if raw_selected else None,
+                "raw_trade_probability": raw_selected.get("trade_probability") if raw_selected else None,
                 "validation_return_pct": selected.get("validation_return_pct") if selected else None,
                 "worst_validation_segment_return_pct": (
                     selected.get("worst_validation_segment_return_pct") if selected else None
                 ),
+                "gate_pass": selected.get("gate_pass") if selected else False,
+                "gate_reject_reasons": selected.get("gate_reject_reasons") if selected else (
+                    raw_selected.get("gate_reject_reasons") if raw_selected else None
+                ),
+                "expected_return_pct": selected.get("expected_return_pct") if selected else None,
+                "uncertainty_pct": selected.get("uncertainty_pct") if selected else None,
+                "regime_risk": regime.get("regime_risk"),
+                "stress_edge_pct": selected.get("stress_edge_pct") if selected else None,
+                "decision_score": selected.get("decision_score") if selected else None,
+                "soft_risk_flags": selected.get("soft_risk_flags") if selected else (
+                    raw_selected.get("soft_risk_flags") if raw_selected else None
+                ),
+                "trade_probability": selected.get("trade_probability") if selected else None,
+                **target_risk_diag,
+                "regime_reason": regime.get("regime_reason"),
+                "regime_history_windows": regime.get("regime_history_windows"),
+                "regime_bad_windows": regime.get("regime_bad_windows"),
                 "best_blocked_alpha": best_any.get("alpha_name") if best_any else None,
                 "best_blocked_mode": best_any.get("mode") if best_any else None,
                 "trade_cost": cost,
@@ -1182,12 +1454,29 @@ def main() -> None:
             "latest_candle": str(latest_ts),
             "validation_start": str(validation_start),
             "validation_end": str(validation_end),
+            "selection_start": str(nested_spans["selection_start"]),
+            "selection_end": str(nested_spans["selection_end"]),
+            "gate_start": str(nested_spans["gate_start"]),
+            "gate_end": str(nested_spans["gate_end"]),
             "log_rows": len(live_rows),
             "candidate_log_rows": len(candidate_rows),
             "output_dir": str(args.output_dir),
             "selected": {key: value for key, value in (selected or {}).items() if key != "policy"},
             "raw_selected": {key: value for key, value in (raw_selected or {}).items() if key != "policy"},
             "best_any": {key: value for key, value in (best_any or {}).items() if key != "policy"},
+            "diplom_risk_overlay": {
+                "enabled": bool(diplom_config.enabled),
+                "predictions_path": str(diplom_config.predictions_path) if diplom_config.predictions_path else None,
+                "risk_weight_pct": diplom_config.risk_weight_pct,
+                "long_veto_p_high": diplom_config.long_veto_p_high,
+                "short_bonus_weight_pct": diplom_config.short_bonus_weight_pct,
+                "stale_days": diplom_config.stale_days,
+                "missing_policy": diplom_config.missing_policy,
+                "enable_yndx_ydex_mapping": diplom_config.enable_yndx_ydex_mapping,
+                "yndx_ydex_effective_date": diplom_config.yndx_ydex_effective_date,
+                "ignored_forbidden_columns": diplom_adapter.ignored_forbidden_columns if diplom_adapter else [],
+                "latest_target_risk": target_risk_diag,
+            },
             "constraints_passed_count": int(sum(bool(row["constraints_ok"]) for row in search_rows)),
             "validation_engine": args.validation_engine,
             "rebalance_on_target_change": rebalance_on_target_change,
@@ -1207,6 +1496,8 @@ def main() -> None:
             "stale_signal_hit": stale_signal_hit,
             "session_stopped": session_stopped,
             "live_gate_reason": live_gate_reason,
+            "regime": regime,
+            "gate_regime_profile": gate_regime_profile,
             "session_loss_stop_hit": session_loss_stop_hit,
             "risk_action": risk_action,
             "pre_trade_equity": pre_trade_equity,
@@ -1224,6 +1515,9 @@ def main() -> None:
             f"{wall_time} candle={latest_ts} equity={equity:.2f} pnl={summary['pnl']:.2f} "
             f"action={action} selected={summary['selected'].get('alpha_name')} targets={target_symbols or 'cash'} "
             f"passed={summary['constraints_passed_count']} signal_age={signal_age_minutes:.1f}m "
+            f"score={summary['selected'].get('decision_score')} edge={summary['selected'].get('stress_edge_pct')} "
+            f"regime={regime.get('regime_risk')} "
+            f"diplom={target_risk_diag.get('diplom_risk_reason')} "
             f"risk={risk_action or 'none'}",
             flush=True,
         )
