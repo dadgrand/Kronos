@@ -1,0 +1,40 @@
+{
+  "run_dir": "outputs\\live_paper_alpha_policy_30m_20260622_172912",
+  "live_log_rows": 26,
+  "candidate_log_rows": 520,
+  "candidate_polls": 26,
+  "unique_symbols": 27,
+  "avg_symbols_per_poll": 20.0,
+  "price_coverage": 1.0,
+  "tradable_rate": 1.0,
+  "selected_candidate_rows": 63,
+  "final_equity_after_close": 9814.939167046672,
+  "final_return_pct_after_close": -1.8506083295332765,
+  "candidate_consistency_matches": 0,
+  "candidate_consistency_checks": 0,
+  "one_step_rows": 71,
+  "candidate_consistency": [],
+  "one_step_summary": [
+    {
+      "label": "selected",
+      "count": 21,
+      "mean": -0.03999657023763259,
+      "min": -0.5845816587504604,
+      "max": 0.39696860339228923
+    },
+    {
+      "label": "top_long",
+      "count": 25,
+      "mean": -0.009201652020752071,
+      "min": -0.37002775208141436,
+      "max": 0.23245002324498998
+    },
+    {
+      "label": "top_short",
+      "count": 25,
+      "mean": -0.04661702411475854,
+      "min": -0.5845816587504604,
+      "max": 0.39696860339228923
+    }
+  ]
+}

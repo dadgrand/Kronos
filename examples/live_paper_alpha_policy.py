@@ -245,6 +245,11 @@ def mark_portfolio(cash: float, positions: dict[str, float], prices: dict[str, f
     return equity, values
 
 
+def weights_changed(previous: dict[str, float], current: dict[str, float], tolerance: float) -> bool:
+    symbols = set(previous) | set(current)
+    return any(abs(float(previous.get(symbol, 0.0)) - float(current.get(symbol, 0.0))) > tolerance for symbol in symbols)
+
+
 def trade_to_weights(
     cash: float,
     positions: dict[str, float],
@@ -575,6 +580,9 @@ def main() -> None:
     parser.add_argument("--fetch-workers", type=int, default=12)
     parser.add_argument("--candidate-log-top-n", type=int, default=0)
     parser.add_argument("--validation-engine", choices=["fast", "full"], default="fast")
+    parser.add_argument("--rebalance-on-target-change", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--target-change-tolerance", type=float, default=None)
+    parser.add_argument("--max-session-loss-pct", type=float, default=None)
     parser.add_argument("--close-on-exit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -585,6 +593,26 @@ def main() -> None:
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         args.output_dir = Path("outputs") / f"live_paper_alpha_policy_{stamp}"
     args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    rebalance_on_target_change = (
+        bool(args.rebalance_on_target_change)
+        if args.rebalance_on_target_change is not None
+        else bool(config.get("live_rebalance_on_target_change", False))
+    )
+    target_change_tolerance = (
+        float(args.target_change_tolerance)
+        if args.target_change_tolerance is not None
+        else float(config.get("live_target_change_tolerance", 0.05))
+    )
+    max_session_loss_pct = (
+        float(args.max_session_loss_pct)
+        if args.max_session_loss_pct is not None
+        else (
+            None
+            if config.get("live_max_session_loss_pct") is None
+            else float(config.get("live_max_session_loss_pct"))
+        )
+    )
 
     _, symbols, base_open, base_close, base_volume = read_intraday_matrix(Path(config["dataset_dir"]), int(config["interval"]))
     session = requests.Session()
@@ -606,6 +634,7 @@ def main() -> None:
     total_cost = 0.0
     total_turnover = 0.0
     last_rebalance_row: int | None = None
+    active_target_weights: dict[str, float] = {}
     cached_decision_candle: pd.Timestamp | None = None
     cached_alpha_scores: dict[str, np.ndarray] | None = None
     cached_selected: dict | None = None
@@ -702,17 +731,35 @@ def main() -> None:
                 latest_row=latest_row,
                 policy=selected_policy,
             )
+        pre_trade_equity, _ = mark_portfolio(cash, positions, prices)
+        session_return_pct = (pre_trade_equity / float(config["initial_cash"]) - 1.0) * 100.0
+        risk_action = ""
+        session_loss_stop_hit = (
+            max_session_loss_pct is not None
+            and bool(positions)
+            and session_return_pct <= -abs(max_session_loss_pct)
+        )
+        if session_loss_stop_hit:
+            target_weights = {}
+            risk_action = "session_loss_stop"
         selected_scores_for_log = (
             alpha_scores[score_source["alpha_name"]]
             if score_source is not None
             else np.zeros_like(matrices["bar_return"], dtype=np.float32)
         )
 
+        target_change_rebalance = (
+            rebalance_on_target_change
+            and bool(positions)
+            and weights_changed(active_target_weights, target_weights, target_change_tolerance)
+        )
         rebalance_due = (
             selected is None
             or last_rebalance_row is None
             or (latest_row - last_rebalance_row) >= int(selected.get("rebalance_every", 1))
             or (not positions and bool(target_weights))
+            or target_change_rebalance
+            or session_loss_stop_hit
         )
         cost = 0.0
         turnover = 0.0
@@ -729,7 +776,13 @@ def main() -> None:
             total_cost += cost
             total_turnover += turnover
             last_rebalance_row = latest_row
-            action = "rebalance" if trades else ("cash" if not target_weights else "no_trade")
+            active_target_weights = dict(target_weights)
+            if session_loss_stop_hit:
+                action = "close_session_loss"
+            elif target_change_rebalance:
+                action = "rebalance_target_change" if trades else "target_change_no_trade"
+            else:
+                action = "rebalance" if trades else ("cash" if not target_weights else "no_trade")
 
         equity, position_values = mark_portfolio(cash, positions, prices)
         wall_time = now.isoformat(timespec="seconds")
@@ -787,6 +840,14 @@ def main() -> None:
                 "candidate_count": len(search_rows),
                 "constraints_passed_count": int(sum(bool(row["constraints_ok"]) for row in search_rows)),
                 "validation_engine": args.validation_engine,
+                "rebalance_on_target_change": rebalance_on_target_change,
+                "target_change_rebalance": target_change_rebalance,
+                "target_change_tolerance": target_change_tolerance,
+                "max_session_loss_pct": max_session_loss_pct,
+                "session_loss_stop_hit": session_loss_stop_hit,
+                "risk_action": risk_action,
+                "pre_trade_equity": pre_trade_equity,
+                "pre_trade_return_pct": session_return_pct,
                 "decision_cache_hit": decision_cache_hit,
                 "decision_elapsed_seconds": decision_elapsed_seconds,
                 "poll_elapsed_seconds": time.perf_counter() - poll_started,
@@ -820,6 +881,13 @@ def main() -> None:
             "best_any": {key: value for key, value in (best_any or {}).items() if key != "policy"},
             "constraints_passed_count": int(sum(bool(row["constraints_ok"]) for row in search_rows)),
             "validation_engine": args.validation_engine,
+            "rebalance_on_target_change": rebalance_on_target_change,
+            "target_change_tolerance": target_change_tolerance,
+            "max_session_loss_pct": max_session_loss_pct,
+            "session_loss_stop_hit": session_loss_stop_hit,
+            "risk_action": risk_action,
+            "pre_trade_equity": pre_trade_equity,
+            "pre_trade_return_pct": session_return_pct,
             "decision_cache_hit": decision_cache_hit,
             "decision_elapsed_seconds": decision_elapsed_seconds,
             "poll_elapsed_seconds": time.perf_counter() - poll_started,
