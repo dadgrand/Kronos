@@ -50,6 +50,7 @@ CONFIG_FIELDS = [
     "k_grid",
     "gross_grid",
     "rebalance_grid",
+    "signal_delay_bars",
     "initial_cash",
     "cost_bps",
     "stress_cost_bps",
@@ -139,6 +140,28 @@ def build_alpha_scores(
     return scores
 
 
+def delay_matrix(values: np.ndarray, delay_bars: int, fill_value: float = np.nan) -> np.ndarray:
+    if delay_bars <= 0:
+        return values
+    delayed = np.full(values.shape, fill_value, dtype=values.dtype)
+    delayed[delay_bars:] = values[:-delay_bars]
+    return delayed
+
+
+def delay_vector(values: np.ndarray, delay_bars: int, fill_value: float = 0.0) -> np.ndarray:
+    if delay_bars <= 0:
+        return values
+    delayed = np.full(values.shape, fill_value, dtype=values.dtype)
+    delayed[delay_bars:] = values[:-delay_bars]
+    return delayed
+
+
+def delay_market_features(market_features: dict[str, np.ndarray], delay_bars: int) -> dict[str, np.ndarray]:
+    if delay_bars <= 0:
+        return market_features
+    return {key: delay_vector(value, delay_bars, 0.0) for key, value in market_features.items()}
+
+
 def build_candidates(
     alpha_names: list[str],
     *,
@@ -212,6 +235,7 @@ def main() -> None:
     parser.add_argument("--k-grid", default="1,3")
     parser.add_argument("--gross-grid", default="0.5,1.0,1.5")
     parser.add_argument("--rebalance-grid", default="24")
+    parser.add_argument("--signal-delay-bars", type=int, default=0)
     parser.add_argument("--initial-cash", type=float, default=10000.0)
     parser.add_argument("--cost-bps", type=float, default=10.0)
     parser.add_argument("--stress-cost-bps", type=float, default=20.0)
@@ -247,6 +271,14 @@ def main() -> None:
         kinds=[item.strip() for item in args.alpha_kinds.split(",") if item.strip()],
         normalize=args.alpha_normalize,
     )
+    if args.signal_delay_bars < 0:
+        raise ValueError("--signal-delay-bars must be non-negative")
+    if args.signal_delay_bars > 0:
+        alpha_scores = {
+            alpha_name: delay_matrix(scores, args.signal_delay_bars, np.nan)
+            for alpha_name, scores in alpha_scores.items()
+        }
+        market_features = delay_market_features(market_features, args.signal_delay_bars)
     modes = parse_modes(args.modes)
     confidences = {
         (alpha_name, mode): score_confidence(scores, matrices["tradable"], mode)
@@ -495,6 +527,7 @@ def main() -> None:
         "k_grid": parse_ints(args.k_grid),
         "gross_grid": parse_floats(args.gross_grid),
         "rebalance_grid": parse_ints(args.rebalance_grid),
+        "signal_delay_bars": args.signal_delay_bars,
         "start_date": args.start_date,
         "end_date": args.end_date,
         "validation_days": args.validation_days,
@@ -525,7 +558,8 @@ def main() -> None:
         "protocol": (
             "For each window, alpha and execution parameters are selected on the validation slice only. "
             "A cash fallback is used when no candidate satisfies the validation robustness constraints. "
-            "The selected candidate is then evaluated on the immediately following test slice."
+            "The selected candidate is then evaluated on the immediately following test slice. "
+            f"Alpha scores and regime features are delayed by {args.signal_delay_bars} bar(s) before selection."
         ),
     }
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -542,6 +576,7 @@ def main() -> None:
         f"- Trade windows: {len(traded)}",
         f"- Validation days: {args.validation_days}",
         f"- Test days: {args.test_days}",
+        f"- Signal delay bars: {args.signal_delay_bars}",
         f"- Candidate count per window: {len(candidates)}",
         f"- Cost: {args.cost_bps:.2f} bps",
         f"- Min validation return: {args.min_validation_return_pct}",

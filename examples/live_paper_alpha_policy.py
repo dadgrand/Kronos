@@ -22,6 +22,8 @@ from walk_forward_alpha_policy_lab import (
     build_alpha_scores,
     build_candidates,
     constraints_pass,
+    delay_market_features,
+    delay_matrix,
     stop_policy,
 )
 from walk_forward_stop_aware_policy_lab import parse_modes
@@ -764,6 +766,9 @@ def main() -> None:
             else float(config.get("live_max_session_loss_pct"))
         )
     )
+    signal_delay_bars = int(config.get("signal_delay_bars", 0))
+    if signal_delay_bars < 0:
+        raise ValueError("signal_delay_bars must be non-negative")
     max_signal_age_minutes = (
         float(args.max_signal_age_minutes)
         if args.max_signal_age_minutes is not None
@@ -860,6 +865,8 @@ def main() -> None:
             )
         matrices = build_matrices(open_px, close_px, volume, int(config["horizon"]))
         market_features = compute_market_features(close_px.index, list(close_px.columns), matrices["bar_return"])
+        if signal_delay_bars > 0:
+            market_features = delay_market_features(market_features, signal_delay_bars)
 
         latest_row = len(close_px.index) - 1
         latest_ts = pd.Timestamp(close_px.index[latest_row])
@@ -889,6 +896,11 @@ def main() -> None:
                 kinds=parse_csv_strings(config["alpha_kinds"]),
                 normalize=config["alpha_normalize"],
             )
+            if signal_delay_bars > 0:
+                alpha_scores = {
+                    alpha_name: delay_matrix(scores, signal_delay_bars, np.nan)
+                    for alpha_name, scores in alpha_scores.items()
+                }
             confidences = (
                 {
                     (alpha_name, mode): score_confidence(scores, matrices["tradable"], mode)
@@ -951,7 +963,7 @@ def main() -> None:
         if selected is not None:
             selected_policy = selected["policy"]
             selected_scores = alpha_scores[selected["alpha_name"]]
-            if signal_source == "marketdata_bar":
+            if signal_source == "marketdata_bar" and signal_delay_bars == 0:
                 selected_scores = selected_scores.copy()
                 selected_scores[latest_row] = current_alpha_score_vector(
                     close_px,
@@ -1004,7 +1016,7 @@ def main() -> None:
             selected_scores_for_log = selected_scores_for_execution
         else:
             selected_scores_for_log = alpha_scores[score_source["alpha_name"]]
-            if signal_source == "marketdata_bar":
+            if signal_source == "marketdata_bar" and signal_delay_bars == 0:
                 selected_scores_for_log = selected_scores_for_log.copy()
                 selected_scores_for_log[latest_row] = current_alpha_score_vector(
                     close_px,
@@ -1126,6 +1138,7 @@ def main() -> None:
                 "target_change_rebalance": target_change_rebalance,
                 "target_change_tolerance": target_change_tolerance,
                 "max_session_loss_pct": max_session_loss_pct,
+                "signal_delay_bars": signal_delay_bars,
                 "max_signal_age_minutes": max_signal_age_minutes,
                 "signal_source": signal_source,
                 "live_score_uses_marketdata": live_score_uses_marketdata,
@@ -1180,6 +1193,7 @@ def main() -> None:
             "rebalance_on_target_change": rebalance_on_target_change,
             "target_change_tolerance": target_change_tolerance,
             "max_session_loss_pct": max_session_loss_pct,
+            "signal_delay_bars": signal_delay_bars,
             "max_signal_age_minutes": max_signal_age_minutes,
             "signal_source": signal_source,
             "live_score_uses_marketdata": live_score_uses_marketdata,
@@ -1269,6 +1283,7 @@ def main() -> None:
                 "target_change_rebalance": False,
                 "target_change_tolerance": target_change_tolerance,
                 "max_session_loss_pct": max_session_loss_pct,
+                "signal_delay_bars": signal_delay_bars,
                 "max_signal_age_minutes": max_signal_age_minutes,
                 "signal_source": signal_source,
                 "live_score_uses_marketdata": live_score_uses_marketdata,
