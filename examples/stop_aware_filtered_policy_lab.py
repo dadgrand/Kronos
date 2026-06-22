@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from filtered_neural_policy_lab import compute_market_features, finite_quantiles, short_confidence
+from filtered_neural_policy_lab import compute_market_features, finite_quantiles
 from neural_policy_lab import build_matrices, read_intraday_matrix, split_masks
 
 
@@ -110,7 +110,8 @@ def select_target(
 ) -> np.ndarray:
     target = np.zeros(scores.shape[1], dtype=np.float32)
     valid = np.isfinite(scores[row]) & tradable[row]
-    if valid.sum() < policy.k:
+    required = 2 * policy.k if policy.mode == "long_short" else policy.k
+    if valid.sum() < required:
         return target
 
     candidates = np.flatnonzero(valid)
@@ -121,9 +122,33 @@ def select_target(
     elif policy.mode == "long_only":
         selected = order[-policy.k :]
         target[selected] = policy.gross / policy.k
+    elif policy.mode == "long_short":
+        shorts = order[: policy.k]
+        longs = order[-policy.k :]
+        target[shorts] = -(policy.gross / 2.0) / policy.k
+        target[longs] = (policy.gross / 2.0) / policy.k
     else:
         raise ValueError(f"unsupported mode: {policy.mode}")
     return target
+
+
+def score_confidence(scores: np.ndarray, tradable: np.ndarray, mode: str) -> np.ndarray:
+    confidence = np.zeros(scores.shape[0], dtype=np.float32)
+    for row in range(scores.shape[0]):
+        valid = np.isfinite(scores[row]) & tradable[row]
+        if not valid.any():
+            continue
+        values = scores[row, valid]
+        median = float(np.nanmedian(values))
+        if mode == "short_only":
+            confidence[row] = max(0.0, median - float(np.nanmin(values)))
+        elif mode == "long_only":
+            confidence[row] = max(0.0, float(np.nanmax(values)) - median)
+        elif mode == "long_short":
+            confidence[row] = max(0.0, float(np.nanmax(values)) - float(np.nanmin(values)))
+        else:
+            raise ValueError(f"unsupported mode: {mode}")
+    return confidence
 
 
 def backtest_stop_aware(
@@ -337,7 +362,7 @@ def main() -> None:
     parser.add_argument("--interval", type=int, default=10)
     parser.add_argument("--train-end", default="2026-06-01")
     parser.add_argument("--validation-end", default="2026-06-13")
-    parser.add_argument("--mode", choices=["short_only", "long_only"], default="short_only")
+    parser.add_argument("--mode", choices=["short_only", "long_only", "long_short"], default="short_only")
     parser.add_argument("--k", type=int, default=1)
     parser.add_argument("--max-gross", type=float, default=1.5)
     parser.add_argument("--rebalance-grid", default="24")
@@ -369,7 +394,7 @@ def main() -> None:
         raise ValueError(f"scores shape {scores.shape} does not match market matrix {matrices['bar_return'].shape}")
 
     market_features = compute_market_features(index, symbols, matrices["bar_return"])
-    confidence = short_confidence(scores, matrices["tradable"])
+    confidence = score_confidence(scores, matrices["tradable"], args.mode)
     validation_mask = masks["validation"]
     confidence_grid = finite_quantiles(confidence[validation_mask], [0.0, 0.50, 0.70, 0.80, 0.90])
     mom24_grid = finite_quantiles(market_features["market_mom_24"][validation_mask], [0.40, 0.60, 0.80, 1.0])
