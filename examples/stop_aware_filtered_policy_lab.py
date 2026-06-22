@@ -271,6 +271,51 @@ def selection_score(summary: dict, drawdown_penalty: float, turnover_penalty: fl
     )
 
 
+def segment_diagnostics(
+    bars: pd.DataFrame,
+    *,
+    split: str,
+    initial_cash: float,
+    segment_count: int,
+) -> pd.DataFrame:
+    if bars.empty or segment_count <= 0:
+        return pd.DataFrame()
+
+    rows = []
+    previous_equity = float(initial_cash)
+    indices = np.array_split(np.arange(len(bars)), segment_count)
+    for segment_id, index_part in enumerate(indices, start=1):
+        if index_part.size == 0:
+            continue
+        segment = bars.iloc[index_part]
+        start_equity = previous_equity
+        end_equity = float(segment["equity"].iloc[-1])
+        equity_curve = np.r_[start_equity, segment["equity"].to_numpy(dtype=np.float64)]
+        peak = np.maximum.accumulate(equity_curve)
+        rows.append(
+            {
+                "split": split,
+                "segment": segment_id,
+                "start_row": int(segment["row"].iloc[0]),
+                "end_row": int(segment["row"].iloc[-1]),
+                "bars": int(len(segment)),
+                "start_equity": start_equity,
+                "end_equity": end_equity,
+                "return_pct": float((end_equity / start_equity - 1.0) * 100.0),
+                "max_drawdown_pct": float(((equity_curve / peak) - 1.0).min() * 100.0),
+                "active_rate": float((segment["gross_exposure"] > 0.0).mean()),
+                "avg_turnover_per_bar": float(segment["turnover"].mean()),
+                "mean_gross_exposure": float(segment["gross_exposure"].mean()),
+                "rebalance_count": int((segment["action"] == "rebalance").sum()),
+                "stop_exits": int((segment["action"] == "close_stop_loss").sum()),
+                "take_profit_exits": int((segment["action"] == "close_take_profit").sum()),
+                "filter_exits": int((segment["action"] == "close_filter_fail").sum()),
+            }
+        )
+        previous_equity = end_equity
+    return pd.DataFrame(rows)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Stop-aware validation-selected MOEX policy lab.")
     parser.add_argument("--dataset-dir", type=Path, default=Path("datasets/moex_intraday_6f8f836cc811"))
@@ -290,6 +335,7 @@ def main() -> None:
     parser.add_argument("--drawdown-penalty", type=float, default=0.35)
     parser.add_argument("--turnover-penalty", type=float, default=2.0)
     parser.add_argument("--target-return-pct", type=float, default=10.0)
+    parser.add_argument("--segment-count", type=int, default=5)
     parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()
 
@@ -414,6 +460,20 @@ def main() -> None:
     pd.DataFrame([test_summary]).to_csv(args.output_dir / "selected_test_summary.csv", index=False)
     validation_bars.to_csv(args.output_dir / "selected_validation_bars.csv", index=False)
     test_bars.to_csv(args.output_dir / "selected_test_bars.csv", index=False)
+    validation_segments = segment_diagnostics(
+        validation_bars,
+        split="validation",
+        initial_cash=args.initial_cash,
+        segment_count=args.segment_count,
+    )
+    test_segments = segment_diagnostics(
+        test_bars,
+        split="test",
+        initial_cash=args.initial_cash,
+        segment_count=args.segment_count,
+    )
+    validation_segments.to_csv(args.output_dir / "selected_validation_segments.csv", index=False)
+    test_segments.to_csv(args.output_dir / "selected_test_segments.csv", index=False)
     pd.DataFrame(sensitivity).to_csv(args.output_dir / "cost_sensitivity.csv", index=False)
     (args.output_dir / "selected_policy.json").write_text(
         json.dumps(asdict(selected), indent=2, ensure_ascii=False),
@@ -430,9 +490,16 @@ def main() -> None:
         "initial_cash": args.initial_cash,
         "cost_bps": args.cost_bps,
         "target_return_pct": args.target_return_pct,
+        "segment_count": args.segment_count,
         "selected_policy": asdict(selected),
         "validation_summary": validation_summary,
         "test_summary": test_summary,
+        "validation_segments": validation_segments.to_dict(orient="records"),
+        "test_segments": test_segments.to_dict(orient="records"),
+        "worst_validation_segment_return_pct": (
+            float(validation_segments["return_pct"].min()) if not validation_segments.empty else None
+        ),
+        "worst_test_segment_return_pct": float(test_segments["return_pct"].min()) if not test_segments.empty else None,
         "cost_sensitivity": sensitivity,
         "target_hit": test_summary["return_pct"] >= args.target_return_pct,
         "protocol": (
@@ -469,6 +536,11 @@ def main() -> None:
         f"- Max drawdown: {test_summary['max_drawdown_pct']:.2f}%",
         f"- Avg turnover/bar: {test_summary['avg_turnover_per_bar']:.4f}",
         f"- Target hit ({args.target_return_pct:.1f}%): {test_summary['return_pct'] >= args.target_return_pct}",
+        "",
+        "## Segment Diagnostics",
+        "",
+        f"- Worst validation segment return: {validation_segments['return_pct'].min():.2f}%",
+        f"- Worst test segment return: {test_segments['return_pct'].min():.2f}%",
         "",
         "Cost sensitivity is computed after policy selection and is not used to choose the policy.",
         "",

@@ -86,6 +86,25 @@ Smoke-test output:
 
 The 10% target is reached on this research test split: 10,000 RUB becomes 11,131.61 RUB.
 
+## Segment Stability
+
+The selected policy was also split into five chronological segments per split. This is a diagnostic only; it is not used for selection.
+
+| Split | Segment | Return | Max drawdown | Active rate | Avg turnover/bar |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Validation | 1 | 2.45% | -2.35% | 22.12% | 0.0276 |
+| Validation | 2 | 1.00% | -3.14% | 78.34% | 0.1037 |
+| Validation | 3 | -2.78% | -3.14% | 88.94% | 0.0968 |
+| Validation | 4 | 27.39% | -2.87% | 54.17% | 0.0625 |
+| Validation | 5 | -2.92% | -4.54% | 44.44% | 0.0556 |
+| Test | 1 | -2.35% | -3.01% | 38.71% | 0.0484 |
+| Test | 2 | 0.00% | 0.00% | 0.00% | 0.0000 |
+| Test | 3 | 7.24% | -2.45% | 67.74% | 0.0847 |
+| Test | 4 | 7.46% | -3.26% | 100.00% | 0.1210 |
+| Test | 5 | -1.08% | -7.14% | 80.65% | 0.0968 |
+
+Worst segment returns: validation -2.92%, test -2.35%. The total test return is positive, but it is not uniformly distributed; most of the gain comes from the middle of the test split.
+
 ## Post-Selection Cost Sensitivity
 
 | Cost bps | Test return |
@@ -110,4 +129,5 @@ It is not yet a production proof. The policy remains short-only and one-symbol c
 - `top_validation_policies.csv`: top 50 validation policies.
 - `selected_validation_summary.csv` and `selected_test_summary.csv`: split summaries.
 - `selected_validation_bars.csv` and `selected_test_bars.csv`: equity/action traces.
+- `selected_validation_segments.csv` and `selected_test_segments.csv`: chronological segment diagnostics.
 - `cost_sensitivity.csv`: test sensitivity to execution costs.
