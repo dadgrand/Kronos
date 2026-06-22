@@ -30,6 +30,21 @@ def load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [json_safe(item) for item in value]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        number = float(value)
+        return number if np.isfinite(number) else None
+    return value
+
+
 def last_numeric(series: pd.Series) -> float | None:
     values = pd.to_numeric(series, errors="coerce").dropna()
     if values.empty:
@@ -186,7 +201,10 @@ def analyze_run(run_dir: Path, output_dir: Path, top_n: int) -> dict:
         "candidate_consistency": match_rows,
         "one_step_summary": one_step_summary,
     }
-    (output_dir / "summary.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    (output_dir / "summary.json").write_text(
+        json.dumps(json_safe(result), indent=2, ensure_ascii=False, allow_nan=False),
+        encoding="utf-8",
+    )
 
     readme = [
         "# Live Candidate Log Analysis",
@@ -224,7 +242,7 @@ def main() -> None:
     args = parser.parse_args()
 
     result = analyze_run(args.run_dir, args.output_dir, args.top_n)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    print(json.dumps(json_safe(result), indent=2, ensure_ascii=False, allow_nan=False))
 
 
 if __name__ == "__main__":

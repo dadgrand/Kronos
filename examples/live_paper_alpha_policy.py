@@ -3,6 +3,7 @@ import datetime as dt
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
 
@@ -58,6 +59,52 @@ def parse_csv_floats(value: str) -> list[float]:
 
 def parse_csv_strings(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def fetch_symbol_candles(symbol: str, board: str, interval: int, from_date: str, till_date: str) -> pd.DataFrame:
+    session = requests.Session()
+    session.trust_env = False
+    return fetch_candles(session, symbol, board, interval, from_date, till_date)
+
+
+def fetch_live_candles(
+    symbols: list[str],
+    *,
+    board: str,
+    interval: int,
+    from_date: str,
+    till_date: str,
+    workers: int,
+) -> tuple[pd.DataFrame, list[str], dict]:
+    started = time.perf_counter()
+    live_parts = []
+    errors = []
+    if workers <= 1:
+        for symbol in symbols:
+            try:
+                live_parts.append(fetch_symbol_candles(symbol, board, interval, from_date, till_date))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{symbol}: {exc}")
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(fetch_symbol_candles, symbol, board, interval, from_date, till_date): symbol
+                for symbol in symbols
+            }
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    live_parts.append(future.result())
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{symbol}: {exc}")
+    live = pd.concat(live_parts, ignore_index=True) if live_parts else pd.DataFrame()
+    stats = {
+        "fetch_elapsed_seconds": time.perf_counter() - started,
+        "fetch_parts": len(live_parts),
+        "fetch_errors": len(errors),
+        "fetch_rows": int(len(live)),
+    }
+    return live, errors, stats
 
 
 def mark_portfolio(cash: float, positions: dict[str, float], prices: dict[str, float]) -> tuple[float, dict[str, float]]:
@@ -136,6 +183,14 @@ def select_validation_candidate(
     rows = []
     best = None
     best_any = None
+    needs_stress = (
+        config.get("min_validation_stress_return_pct") is not None
+        or abs(float(config["stress_selection_weight"])) > 0.0
+    )
+    needs_segment = (
+        config.get("min_validation_segment_return_pct") is not None
+        or abs(float(config["segment_selection_penalty"])) > 0.0
+    )
     for candidate in candidates:
         scores = alpha_scores[candidate.alpha_name]
         confidence = confidences[(candidate.alpha_name, candidate.mode)]
@@ -151,43 +206,64 @@ def select_validation_candidate(
             initial_cash=float(config["initial_cash"]),
             cost_bps=float(config["cost_bps"]),
         )
-        validation_stress_summary, _ = backtest_stop_aware(
-            scores,
-            matrices,
-            masks,
-            market_features,
-            confidence,
-            "validation",
-            policy,
-            initial_cash=float(config["initial_cash"]),
-            cost_bps=float(config["stress_cost_bps"]),
-        )
-        validation_segments = segment_diagnostics(
-            validation_bars,
-            split="validation",
-            initial_cash=float(config["initial_cash"]),
-            segment_count=int(config["segment_count"]),
-        )
-        worst_segment = float(validation_segments["return_pct"].min()) if not validation_segments.empty else None
         raw_score = selection_score(
             validation_summary,
             float(config["drawdown_penalty"]),
             float(config["turnover_penalty"]),
         )
+        preliminary_ok = True
+        if config.get("min_validation_return_pct") is not None:
+            preliminary_ok &= float(validation_summary["return_pct"]) >= float(config["min_validation_return_pct"])
+        if config.get("max_validation_drawdown_pct") is not None:
+            preliminary_ok &= float(validation_summary["max_drawdown_pct"]) >= -abs(
+                float(config["max_validation_drawdown_pct"])
+            )
+
+        worst_segment = None
+        segment_ok = preliminary_ok
+        if preliminary_ok and needs_segment:
+            validation_segments = segment_diagnostics(
+                validation_bars,
+                split="validation",
+                initial_cash=float(config["initial_cash"]),
+                segment_count=int(config["segment_count"]),
+            )
+            worst_segment = float(validation_segments["return_pct"].min()) if not validation_segments.empty else None
+            if config.get("min_validation_segment_return_pct") is not None:
+                segment_ok &= worst_segment is not None and worst_segment >= float(
+                    config["min_validation_segment_return_pct"]
+                )
+
+        validation_stress_summary = {"return_pct": np.nan, "max_drawdown_pct": np.nan}
+        stress_ok = preliminary_ok and segment_ok
+        if preliminary_ok and segment_ok and needs_stress:
+            validation_stress_summary, _ = backtest_stop_aware(
+                scores,
+                matrices,
+                masks,
+                market_features,
+                confidence,
+                "validation",
+                policy,
+                initial_cash=float(config["initial_cash"]),
+                cost_bps=float(config["stress_cost_bps"]),
+            )
+            if config.get("min_validation_stress_return_pct") is not None:
+                stress_ok &= float(validation_stress_summary["return_pct"]) >= float(
+                    config["min_validation_stress_return_pct"]
+                )
+
+        stress_component = (
+            float(config["stress_selection_weight"]) * float(validation_stress_summary["return_pct"])
+            if needs_stress
+            else 0.0
+        )
         selection = (
             raw_score
             + float(config["segment_selection_penalty"]) * float(worst_segment if worst_segment is not None else -999.0)
-            + float(config["stress_selection_weight"]) * float(validation_stress_summary["return_pct"])
+            + stress_component
         )
-        ok = constraints_pass(
-            validation_summary,
-            validation_stress_summary,
-            worst_segment,
-            min_validation_return_pct=config.get("min_validation_return_pct"),
-            min_validation_stress_return_pct=config.get("min_validation_stress_return_pct"),
-            min_validation_segment_return_pct=config.get("min_validation_segment_return_pct"),
-            max_validation_drawdown_pct=config.get("max_validation_drawdown_pct"),
-        )
+        ok = bool(preliminary_ok and segment_ok and stress_ok)
         row = {
             **asdict(candidate),
             "validation_return_pct": validation_summary["return_pct"],
@@ -203,6 +279,25 @@ def select_validation_candidate(
             best_any = {**row, "raw_candidate_score": selection, "policy": policy}
         if ok and (best is None or selection > best["selection_score"]):
             best = {**row, "policy": policy}
+    if not needs_stress:
+        for record in [best, best_any]:
+            if record is None:
+                continue
+            scores = alpha_scores[record["alpha_name"]]
+            confidence = confidences[(record["alpha_name"], record["mode"])]
+            stress_summary, _ = backtest_stop_aware(
+                scores,
+                matrices,
+                masks,
+                market_features,
+                confidence,
+                "validation",
+                record["policy"],
+                initial_cash=float(config["initial_cash"]),
+                cost_bps=float(config["stress_cost_bps"]),
+            )
+            record["validation_stress_return_pct"] = stress_summary["return_pct"]
+            record["validation_stress_max_drawdown_pct"] = stress_summary["max_drawdown_pct"]
     return best, best_any, rows
 
 
@@ -302,6 +397,7 @@ def main() -> None:
     parser.add_argument("--duration-minutes", type=float, default=30.0)
     parser.add_argument("--poll-seconds", type=float, default=60.0)
     parser.add_argument("--fetch-days", type=int, default=8)
+    parser.add_argument("--fetch-workers", type=int, default=12)
     parser.add_argument("--candidate-log-top-n", type=int, default=0)
     parser.add_argument("--close-on-exit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--once", action="store_true")
@@ -317,28 +413,46 @@ def main() -> None:
     _, symbols, base_open, base_close, base_volume = read_intraday_matrix(Path(config["dataset_dir"]), int(config["interval"]))
     session = requests.Session()
     session.trust_env = False
+    modes = parse_modes(config["modes"])
+    candidates = build_candidates(
+        [
+            f"{kind}_{lag}"
+            for lag in parse_csv_ints(config["alpha_lags"])
+            for kind in parse_csv_strings(config["alpha_kinds"])
+        ],
+        modes=modes,
+        k_grid=parse_csv_ints(config["k_grid"]),
+        gross_grid=parse_csv_floats(config["gross_grid"]),
+        rebalance_grid=parse_csv_ints(config["rebalance_grid"]),
+    )
     cash = float(config["initial_cash"])
     positions: dict[str, float] = {}
     total_cost = 0.0
     total_turnover = 0.0
     last_rebalance_row: int | None = None
+    cached_decision_candle: pd.Timestamp | None = None
+    cached_alpha_scores: dict[str, np.ndarray] | None = None
+    cached_selected: dict | None = None
+    cached_best_any: dict | None = None
+    cached_search_rows: list[dict] | None = None
     live_rows = []
     candidate_rows = []
     start_time = time.time()
     end_time = start_time + args.duration_minutes * 60.0
 
     while True:
+        poll_started = time.perf_counter()
         now = dt.datetime.now()
         from_date = (now.date() - dt.timedelta(days=args.fetch_days)).isoformat()
         till_date = now.date().isoformat()
-        live_parts = []
-        errors = []
-        for symbol in symbols:
-            try:
-                live_parts.append(fetch_candles(session, symbol, args.board, int(config["interval"]), from_date, till_date))
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{symbol}: {exc}")
-        live = pd.concat(live_parts, ignore_index=True) if live_parts else pd.DataFrame()
+        live, errors, fetch_stats = fetch_live_candles(
+            symbols,
+            board=args.board,
+            interval=int(config["interval"]),
+            from_date=from_date,
+            till_date=till_date,
+            workers=max(1, args.fetch_workers),
+        )
         open_px, close_px, volume = append_live_to_matrix(base_open, base_close, base_volume, live)
         matrices = build_matrices(open_px, close_px, volume, int(config["horizon"]))
         market_features = compute_market_features(close_px.index, list(close_px.columns), matrices["bar_return"])
@@ -350,34 +464,45 @@ def main() -> None:
         validation_mask = np.asarray((close_px.index >= validation_start) & (close_px.index < validation_end))
         masks = {"validation": validation_mask}
 
-        alpha_scores = build_alpha_scores(
-            close_px,
-            lags=parse_csv_ints(config["alpha_lags"]),
-            kinds=parse_csv_strings(config["alpha_kinds"]),
-            normalize=config["alpha_normalize"],
+        decision_started = time.perf_counter()
+        decision_cache_hit = (
+            cached_decision_candle is not None
+            and latest_ts == cached_decision_candle
+            and cached_alpha_scores is not None
+            and cached_search_rows is not None
         )
-        modes = parse_modes(config["modes"])
-        confidences = {
-            (alpha_name, mode): score_confidence(scores, matrices["tradable"], mode)
-            for alpha_name, scores in alpha_scores.items()
-            for mode in modes
-        }
-        candidates = build_candidates(
-            list(alpha_scores),
-            modes=modes,
-            k_grid=parse_csv_ints(config["k_grid"]),
-            gross_grid=parse_csv_floats(config["gross_grid"]),
-            rebalance_grid=parse_csv_ints(config["rebalance_grid"]),
-        )
-        selected, best_any, search_rows = select_validation_candidate(
-            alpha_scores=alpha_scores,
-            confidences=confidences,
-            matrices=matrices,
-            masks=masks,
-            market_features=market_features,
-            candidates=candidates,
-            config=config,
-        )
+        if decision_cache_hit:
+            alpha_scores = cached_alpha_scores
+            selected = cached_selected
+            best_any = cached_best_any
+            search_rows = cached_search_rows
+        else:
+            alpha_scores = build_alpha_scores(
+                close_px,
+                lags=parse_csv_ints(config["alpha_lags"]),
+                kinds=parse_csv_strings(config["alpha_kinds"]),
+                normalize=config["alpha_normalize"],
+            )
+            confidences = {
+                (alpha_name, mode): score_confidence(scores, matrices["tradable"], mode)
+                for alpha_name, scores in alpha_scores.items()
+                for mode in modes
+            }
+            selected, best_any, search_rows = select_validation_candidate(
+                alpha_scores=alpha_scores,
+                confidences=confidences,
+                matrices=matrices,
+                masks=masks,
+                market_features=market_features,
+                candidates=candidates,
+                config=config,
+            )
+            cached_decision_candle = latest_ts
+            cached_alpha_scores = alpha_scores
+            cached_selected = selected
+            cached_best_any = best_any
+            cached_search_rows = search_rows
+        decision_elapsed_seconds = time.perf_counter() - decision_started
 
         candle_prices = close_px.iloc[latest_row].to_dict()
         marketdata = fetch_marketdata(session, args.board, symbols)
@@ -480,6 +605,10 @@ def main() -> None:
                 "trades_json": json.dumps(trades, ensure_ascii=False),
                 "candidate_count": len(search_rows),
                 "constraints_passed_count": int(sum(bool(row["constraints_ok"]) for row in search_rows)),
+                "decision_cache_hit": decision_cache_hit,
+                "decision_elapsed_seconds": decision_elapsed_seconds,
+                "poll_elapsed_seconds": time.perf_counter() - poll_started,
+                **fetch_stats,
                 "errors": " | ".join(errors[:5]),
             }
         )
@@ -508,6 +637,10 @@ def main() -> None:
             "selected": {key: value for key, value in (selected or {}).items() if key != "policy"},
             "best_any": {key: value for key, value in (best_any or {}).items() if key != "policy"},
             "constraints_passed_count": int(sum(bool(row["constraints_ok"]) for row in search_rows)),
+            "decision_cache_hit": decision_cache_hit,
+            "decision_elapsed_seconds": decision_elapsed_seconds,
+            "poll_elapsed_seconds": time.perf_counter() - poll_started,
+            **fetch_stats,
         }
         (args.output_dir / "summary.json").write_text(
             json.dumps(json_safe(summary), indent=2, ensure_ascii=False, allow_nan=False),

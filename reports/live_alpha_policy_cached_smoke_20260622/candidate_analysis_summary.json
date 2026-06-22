@@ -1,0 +1,40 @@
+{
+  "run_dir": "outputs\\live_paper_alpha_policy_cached_smoke_20260622",
+  "live_log_rows": 3,
+  "candidate_log_rows": 40,
+  "candidate_polls": 2,
+  "unique_symbols": 30,
+  "avg_symbols_per_poll": 20.0,
+  "price_coverage": 1.0,
+  "tradable_rate": 1.0,
+  "selected_candidate_rows": 4,
+  "final_equity_after_close": 10016.187050359713,
+  "final_return_pct_after_close": 0.16187050359712796,
+  "candidate_consistency_matches": 0,
+  "candidate_consistency_checks": 0,
+  "one_step_rows": 3,
+  "candidate_consistency": [],
+  "one_step_summary": [
+    {
+      "label": "selected",
+      "count": 0,
+      "mean": null,
+      "min": null,
+      "max": null
+    },
+    {
+      "label": "top_long",
+      "count": 1,
+      "mean": -0.053886568772743004,
+      "min": -0.053886568772743004,
+      "max": -0.053886568772743004
+    },
+    {
+      "label": "top_short",
+      "count": 0,
+      "mean": null,
+      "min": null,
+      "max": null
+    }
+  ]
+}
