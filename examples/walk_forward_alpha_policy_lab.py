@@ -20,6 +20,7 @@ from stop_aware_filtered_policy_lab import (
     score_confidence,
     segment_diagnostics,
     selection_score,
+    select_target,
 )
 from walk_forward_stop_aware_policy_lab import make_windows, parse_modes, split_masks_for_window, summarize_compounded
 
@@ -51,6 +52,7 @@ CONFIG_FIELDS = [
     "gross_grid",
     "rebalance_grid",
     "signal_delay_bars",
+    "engine",
     "initial_cash",
     "cost_bps",
     "stress_cost_bps",
@@ -162,6 +164,312 @@ def delay_market_features(market_features: dict[str, np.ndarray], delay_bars: in
     return {key: delay_vector(value, delay_bars, 0.0) for key, value in market_features.items()}
 
 
+def max_drawdown_pct(equity: np.ndarray) -> float:
+    if equity.size == 0:
+        return 0.0
+    peak = np.maximum.accumulate(equity)
+    return float(((equity / peak) - 1.0).min() * 100.0)
+
+
+def empty_summary(split: str, initial_cash: float) -> dict:
+    return {
+        "split": split,
+        "initial_cash": initial_cash,
+        "final_equity": initial_cash,
+        "pnl": 0.0,
+        "return_pct": 0.0,
+        "max_drawdown_pct": 0.0,
+        "sharpe_like": 0.0,
+        "bars": 0,
+        "active_rate": 0.0,
+        "avg_turnover_per_bar": 0.0,
+        "total_turnover": 0.0,
+        "mean_gross_exposure": 0.0,
+        "stop_exits": 0,
+        "take_profit_exits": 0,
+        "filter_exits": 0,
+    }
+
+
+def summarize_stopless_path(
+    *,
+    split: str,
+    initial_cash: float,
+    gross_bar_returns: np.ndarray,
+    turnover: np.ndarray,
+    gross_exposure: np.ndarray,
+    cost_bps: float,
+) -> tuple[dict, np.ndarray, np.ndarray]:
+    if gross_bar_returns.size == 0:
+        return empty_summary(split, initial_cash), np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    cost_rate = cost_bps / 10000.0
+    net_bar_returns = gross_bar_returns - turnover * cost_rate
+    equity_curve = initial_cash * np.cumprod(np.maximum(0.0, 1.0 + net_bar_returns))
+    summary = {
+        "split": split,
+        "initial_cash": initial_cash,
+        "final_equity": float(equity_curve[-1]),
+        "pnl": float(equity_curve[-1] - initial_cash),
+        "return_pct": float((equity_curve[-1] / initial_cash - 1.0) * 100.0),
+        "max_drawdown_pct": max_drawdown_pct(equity_curve),
+        "sharpe_like": float(
+            net_bar_returns.mean() / (net_bar_returns.std(ddof=0) + 1e-12) * np.sqrt(252 * 50)
+        ),
+        "bars": int(gross_bar_returns.size),
+        "active_rate": float((gross_exposure > 0.0).mean()),
+        "avg_turnover_per_bar": float(turnover.mean()),
+        "total_turnover": float(turnover.sum()),
+        "mean_gross_exposure": float(gross_exposure.mean()),
+        "stop_exits": 0,
+        "take_profit_exits": 0,
+        "filter_exits": 0,
+    }
+    return summary, equity_curve.astype(np.float64, copy=False), net_bar_returns.astype(np.float64, copy=False)
+
+
+def build_stopless_bars(
+    rows: np.ndarray,
+    equity_curve: np.ndarray,
+    net_bar_returns: np.ndarray,
+    gross_bar_returns: np.ndarray,
+    turnover: np.ndarray,
+    gross_exposure: np.ndarray,
+) -> pd.DataFrame:
+    if rows.size == 0:
+        return pd.DataFrame()
+    actions = np.where(turnover > 0.0, "rebalance", "hold")
+    return pd.DataFrame(
+        {
+            "row": rows.astype(np.int64, copy=False),
+            "equity": equity_curve,
+            "bar_return": net_bar_returns,
+            "gross_bar_return": gross_bar_returns,
+            "turnover": turnover,
+            "gross_exposure": gross_exposure,
+            "ending_gross_exposure": gross_exposure,
+            "action": actions,
+            "confidence": np.zeros(rows.size, dtype=np.float64),
+            "filter_fail_count": np.zeros(rows.size, dtype=np.int32),
+            "market_mom_24": np.zeros(rows.size, dtype=np.float64),
+            "market_mom_96": np.zeros(rows.size, dtype=np.float64),
+        }
+    )
+
+
+def worst_segment_return_pct_from_equity(
+    equity_curve: np.ndarray,
+    *,
+    initial_cash: float,
+    segment_count: int,
+) -> float | None:
+    if equity_curve.size == 0 or segment_count <= 0:
+        return None
+    worst = None
+    previous_equity = float(initial_cash)
+    for index_part in np.array_split(np.arange(equity_curve.size), segment_count):
+        if index_part.size == 0:
+            continue
+        end_equity = float(equity_curve[index_part[-1]])
+        if previous_equity == 0.0:
+            segment_return = 0.0 if end_equity == 0.0 else np.inf
+        else:
+            segment_return = (end_equity / previous_equity - 1.0) * 100.0
+        worst = segment_return if worst is None else min(worst, segment_return)
+        previous_equity = end_equity
+    return None if worst is None else float(worst)
+
+
+def fast_stopless_path(
+    scores: np.ndarray,
+    bar_return: np.ndarray,
+    tradable: np.ndarray,
+    rows: np.ndarray,
+    policy: StopAwarePolicy,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    gross_bar_returns = np.zeros(rows.size, dtype=np.float64)
+    turnover = np.zeros(rows.size, dtype=np.float64)
+    gross_exposure = np.zeros(rows.size, dtype=np.float64)
+    weights = np.zeros(scores.shape[1], dtype=np.float32)
+    if rows.size == 0:
+        return gross_bar_returns, turnover, gross_exposure
+
+    rebalance_every = max(1, int(policy.rebalance_every))
+    for segment_start in range(0, rows.size, rebalance_every):
+        row = int(rows[segment_start])
+        target = select_target(scores, tradable, row, policy)
+        turnover[segment_start] = float(np.abs(target - weights).sum())
+        weights = target
+        segment_end = min(rows.size, segment_start + rebalance_every)
+        segment_rows = rows[segment_start:segment_end]
+        gross_bar_returns[segment_start:segment_end] = bar_return[segment_rows] @ weights
+        gross_exposure[segment_start:segment_end] = float(np.abs(weights).sum())
+
+    return gross_bar_returns, turnover, gross_exposure
+
+
+def fast_backtest_stopless_dual_cost(
+    scores: np.ndarray,
+    matrices: dict,
+    rows: np.ndarray,
+    split: str,
+    policy: StopAwarePolicy,
+    *,
+    initial_cash: float,
+    cost_bps: float,
+    stress_cost_bps: float,
+    return_bars: bool,
+) -> tuple[dict, dict, pd.DataFrame | None, np.ndarray]:
+    bar_return = matrices.get("bar_return_clean", matrices["bar_return"])
+    tradable = matrices["tradable"]
+    gross_bar_returns, turnover, gross_exposure = fast_stopless_path(scores, bar_return, tradable, rows, policy)
+    summary, equity_curve, net_bar_returns = summarize_stopless_path(
+        split=split,
+        initial_cash=initial_cash,
+        gross_bar_returns=gross_bar_returns,
+        turnover=turnover,
+        gross_exposure=gross_exposure,
+        cost_bps=cost_bps,
+    )
+    stress_summary, _, _ = summarize_stopless_path(
+        split=split,
+        initial_cash=initial_cash,
+        gross_bar_returns=gross_bar_returns,
+        turnover=turnover,
+        gross_exposure=gross_exposure,
+        cost_bps=stress_cost_bps,
+    )
+    bars = (
+        build_stopless_bars(rows, equity_curve, net_bar_returns, gross_bar_returns, turnover, gross_exposure)
+        if return_bars
+        else None
+    )
+    return summary, stress_summary, bars, equity_curve
+
+
+def run_backtest_pair(
+    scores: np.ndarray,
+    matrices: dict,
+    masks: dict[str, np.ndarray],
+    rows_by_split: dict[str, np.ndarray],
+    market_features: dict[str, np.ndarray],
+    confidence: np.ndarray,
+    split: str,
+    policy: StopAwarePolicy,
+    *,
+    initial_cash: float,
+    cost_bps: float,
+    stress_cost_bps: float,
+    segment_count: int,
+    engine: str,
+) -> tuple[dict, dict, pd.DataFrame | None, float | None]:
+    if engine == "fast":
+        summary, stress_summary, bars, equity_curve = fast_backtest_stopless_dual_cost(
+            scores,
+            matrices,
+            rows_by_split[split],
+            split,
+            policy,
+            initial_cash=initial_cash,
+            cost_bps=cost_bps,
+            stress_cost_bps=stress_cost_bps,
+            return_bars=False,
+        )
+        worst_segment = worst_segment_return_pct_from_equity(
+            equity_curve,
+            initial_cash=initial_cash,
+            segment_count=segment_count,
+        )
+        return summary, stress_summary, bars, worst_segment
+    if engine == "full":
+        summary, bars = backtest_stop_aware(
+            scores,
+            matrices,
+            masks,
+            market_features,
+            confidence,
+            split,
+            policy,
+            initial_cash=initial_cash,
+            cost_bps=cost_bps,
+        )
+        stress_summary, _ = backtest_stop_aware(
+            scores,
+            matrices,
+            masks,
+            market_features,
+            confidence,
+            split,
+            policy,
+            initial_cash=initial_cash,
+            cost_bps=stress_cost_bps,
+        )
+        segments = segment_diagnostics(
+            bars,
+            split=split,
+            initial_cash=initial_cash,
+            segment_count=segment_count,
+        )
+        worst_segment = float(segments["return_pct"].min()) if not segments.empty else None
+        return summary, stress_summary, bars, worst_segment
+    raise ValueError(f"unknown engine={engine}")
+
+
+def run_backtest_with_bars(
+    scores: np.ndarray,
+    matrices: dict,
+    masks: dict[str, np.ndarray],
+    rows_by_split: dict[str, np.ndarray],
+    market_features: dict[str, np.ndarray],
+    confidence: np.ndarray,
+    split: str,
+    policy: StopAwarePolicy,
+    *,
+    initial_cash: float,
+    cost_bps: float,
+    stress_cost_bps: float,
+    engine: str,
+) -> tuple[dict, dict, pd.DataFrame]:
+    if engine == "fast":
+        summary, stress_summary, bars, _ = fast_backtest_stopless_dual_cost(
+            scores,
+            matrices,
+            rows_by_split[split],
+            split,
+            policy,
+            initial_cash=initial_cash,
+            cost_bps=cost_bps,
+            stress_cost_bps=stress_cost_bps,
+            return_bars=True,
+        )
+        return summary, stress_summary, bars if bars is not None else pd.DataFrame()
+    if engine == "full":
+        summary, bars = backtest_stop_aware(
+            scores,
+            matrices,
+            masks,
+            market_features,
+            confidence,
+            split,
+            policy,
+            initial_cash=initial_cash,
+            cost_bps=cost_bps,
+        )
+        stress_summary, _ = backtest_stop_aware(
+            scores,
+            matrices,
+            masks,
+            market_features,
+            confidence,
+            split,
+            policy,
+            initial_cash=initial_cash,
+            cost_bps=stress_cost_bps,
+        )
+        return summary, stress_summary, bars
+    raise ValueError(f"unknown engine={engine}")
+
+
 def build_candidates(
     alpha_names: list[str],
     *,
@@ -236,6 +544,7 @@ def main() -> None:
     parser.add_argument("--gross-grid", default="0.5,1.0,1.5")
     parser.add_argument("--rebalance-grid", default="24")
     parser.add_argument("--signal-delay-bars", type=int, default=0)
+    parser.add_argument("--engine", choices=["full", "fast"], default="full")
     parser.add_argument("--initial-cash", type=float, default=10000.0)
     parser.add_argument("--cost-bps", type=float, default=10.0)
     parser.add_argument("--stress-cost-bps", type=float, default=20.0)
@@ -264,6 +573,8 @@ def main() -> None:
 
     index, symbols, open_px, close_px, volume = read_intraday_matrix(args.dataset_dir, args.interval)
     matrices = build_matrices(open_px, close_px, volume, args.horizon)
+    if args.engine == "fast":
+        matrices["bar_return_clean"] = np.nan_to_num(matrices["bar_return"], nan=0.0)
     market_features = compute_market_features(index, symbols, matrices["bar_return"])
     alpha_scores = build_alpha_scores(
         close_px,
@@ -280,11 +591,19 @@ def main() -> None:
         }
         market_features = delay_market_features(market_features, args.signal_delay_bars)
     modes = parse_modes(args.modes)
-    confidences = {
-        (alpha_name, mode): score_confidence(scores, matrices["tradable"], mode)
-        for alpha_name, scores in alpha_scores.items()
-        for mode in modes
-    }
+    if args.engine == "full":
+        confidences = {
+            (alpha_name, mode): score_confidence(scores, matrices["tradable"], mode)
+            for alpha_name, scores in alpha_scores.items()
+            for mode in modes
+        }
+    else:
+        zero_confidence = np.zeros(matrices["bar_return"].shape[0], dtype=np.float32)
+        confidences = {
+            (alpha_name, mode): zero_confidence
+            for alpha_name in alpha_scores
+            for mode in modes
+        }
     candidates = build_candidates(
         list(alpha_scores),
         modes=modes,
@@ -316,41 +635,26 @@ def main() -> None:
     validation_segments_all = []
     for window in windows:
         masks = split_masks_for_window(index, window)
+        rows_by_split = {split: np.flatnonzero(mask) for split, mask in masks.items()}
         best = None
         for candidate in candidates:
             scores = alpha_scores[candidate.alpha_name]
             confidence = confidences[(candidate.alpha_name, candidate.mode)]
             policy = stop_policy(candidate)
-            validation_summary, validation_bars = backtest_stop_aware(
+            validation_summary, validation_stress_summary, validation_bars, worst_segment = run_backtest_pair(
                 scores,
                 matrices,
                 masks,
+                rows_by_split,
                 market_features,
                 confidence,
                 "validation",
                 policy,
                 initial_cash=args.initial_cash,
                 cost_bps=args.cost_bps,
-            )
-            validation_stress_summary, _ = backtest_stop_aware(
-                scores,
-                matrices,
-                masks,
-                market_features,
-                confidence,
-                "validation",
-                policy,
-                initial_cash=args.initial_cash,
-                cost_bps=args.stress_cost_bps,
-            )
-            validation_segments = segment_diagnostics(
-                validation_bars,
-                split="validation",
-                initial_cash=args.initial_cash,
+                stress_cost_bps=args.stress_cost_bps,
                 segment_count=args.segment_count,
-            )
-            worst_segment = (
-                float(validation_segments["return_pct"].min()) if not validation_segments.empty else None
+                engine=args.engine,
             )
             raw_score = selection_score(validation_summary, args.drawdown_penalty, args.turnover_penalty)
             candidate_score = (
@@ -419,27 +723,36 @@ def main() -> None:
             print(f"window={window.window_id} CASH", flush=True)
             continue
 
-        test_summary, test_bars = backtest_stop_aware(
+        validation_summary_with_bars, _, validation_bars = run_backtest_with_bars(
             best["scores"],
             matrices,
             masks,
+            rows_by_split,
+            market_features,
+            best["confidence"],
+            "validation",
+            best["policy"],
+            initial_cash=args.initial_cash,
+            cost_bps=args.cost_bps,
+            stress_cost_bps=args.stress_cost_bps,
+            engine=args.engine,
+        )
+        best["validation_summary"] = validation_summary_with_bars
+        best["validation_bars"] = validation_bars
+
+        test_summary, test_stress_summary, test_bars = run_backtest_with_bars(
+            best["scores"],
+            matrices,
+            masks,
+            rows_by_split,
             market_features,
             best["confidence"],
             "test",
             best["policy"],
             initial_cash=args.initial_cash,
             cost_bps=args.cost_bps,
-        )
-        test_stress_summary, _ = backtest_stop_aware(
-            best["scores"],
-            matrices,
-            masks,
-            market_features,
-            best["confidence"],
-            "test",
-            best["policy"],
-            initial_cash=args.initial_cash,
-            cost_bps=args.stress_cost_bps,
+            stress_cost_bps=args.stress_cost_bps,
+            engine=args.engine,
         )
         validation_segments = segment_diagnostics(
             best["validation_bars"],
@@ -528,6 +841,7 @@ def main() -> None:
         "gross_grid": parse_floats(args.gross_grid),
         "rebalance_grid": parse_ints(args.rebalance_grid),
         "signal_delay_bars": args.signal_delay_bars,
+        "engine": args.engine,
         "start_date": args.start_date,
         "end_date": args.end_date,
         "validation_days": args.validation_days,
@@ -577,6 +891,7 @@ def main() -> None:
         f"- Validation days: {args.validation_days}",
         f"- Test days: {args.test_days}",
         f"- Signal delay bars: {args.signal_delay_bars}",
+        f"- Engine: {args.engine}",
         f"- Candidate count per window: {len(candidates)}",
         f"- Cost: {args.cost_bps:.2f} bps",
         f"- Min validation return: {args.min_validation_return_pct}",
