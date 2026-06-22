@@ -61,6 +61,130 @@ def parse_csv_strings(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def max_drawdown_pct(equity: np.ndarray) -> float:
+    if equity.size == 0:
+        return 0.0
+    peak = np.maximum.accumulate(equity)
+    return float(((equity / peak) - 1.0).min() * 100.0)
+
+
+def fast_select_target(
+    scores: np.ndarray,
+    tradable: np.ndarray,
+    row: int,
+    policy,
+) -> np.ndarray:
+    target = np.zeros(scores.shape[1], dtype=np.float32)
+    valid = np.isfinite(scores[row]) & tradable[row]
+    required = 2 * policy.k if policy.mode == "long_short" else policy.k
+    if valid.sum() < required:
+        return target
+
+    candidates = np.flatnonzero(valid)
+    order = candidates[np.argsort(scores[row, candidates])]
+    if policy.mode == "short_only":
+        target[order[: policy.k]] = -policy.gross / policy.k
+    elif policy.mode == "long_only":
+        target[order[-policy.k :]] = policy.gross / policy.k
+    elif policy.mode == "long_short":
+        target[order[: policy.k]] = -(policy.gross / 2.0) / policy.k
+        target[order[-policy.k :]] = (policy.gross / 2.0) / policy.k
+    else:
+        raise ValueError(f"unsupported mode: {policy.mode}")
+    return target
+
+
+def fast_backtest_stopless(
+    scores: np.ndarray,
+    matrices: dict,
+    masks: dict[str, np.ndarray],
+    split: str,
+    policy,
+    *,
+    initial_cash: float,
+    cost_bps: float,
+) -> tuple[dict, np.ndarray]:
+    rows = np.flatnonzero(masks[split])
+    weights = np.zeros(scores.shape[1], dtype=np.float32)
+    equity = float(initial_cash)
+    cost_rate = cost_bps / 10000.0
+    equity_curve = np.empty(len(rows), dtype=np.float64)
+    bar_returns = np.empty(len(rows), dtype=np.float64)
+    turnovers = np.empty(len(rows), dtype=np.float64)
+    gross_exposures = np.empty(len(rows), dtype=np.float64)
+    bar_return = matrices["bar_return"]
+    tradable = matrices["tradable"]
+
+    for local_idx, row in enumerate(rows):
+        if local_idx % policy.rebalance_every == 0:
+            target = fast_select_target(scores, tradable, row, policy)
+            turnover = float(np.abs(target - weights).sum())
+            weights = target
+        else:
+            turnover = 0.0
+        gross_bar_return = float(np.nan_to_num(bar_return[row], nan=0.0) @ weights)
+        net_return = gross_bar_return - turnover * cost_rate
+        equity *= max(0.0, 1.0 + net_return)
+        equity_curve[local_idx] = equity
+        bar_returns[local_idx] = net_return
+        turnovers[local_idx] = turnover
+        gross_exposures[local_idx] = float(np.abs(weights).sum())
+
+    if rows.size == 0:
+        summary = {
+            "split": split,
+            "initial_cash": initial_cash,
+            "final_equity": initial_cash,
+            "pnl": 0.0,
+            "return_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+            "sharpe_like": 0.0,
+            "bars": 0,
+            "active_rate": 0.0,
+            "avg_turnover_per_bar": 0.0,
+            "total_turnover": 0.0,
+            "mean_gross_exposure": 0.0,
+            "stop_exits": 0,
+            "take_profit_exits": 0,
+            "filter_exits": 0,
+        }
+        return summary, equity_curve
+
+    summary = {
+        "split": split,
+        "initial_cash": initial_cash,
+        "final_equity": float(equity_curve[-1]),
+        "pnl": float(equity_curve[-1] - initial_cash),
+        "return_pct": float((equity_curve[-1] / initial_cash - 1.0) * 100.0),
+        "max_drawdown_pct": max_drawdown_pct(equity_curve),
+        "sharpe_like": float(bar_returns.mean() / (bar_returns.std(ddof=0) + 1e-12) * np.sqrt(252 * 50)),
+        "bars": int(len(rows)),
+        "active_rate": float((gross_exposures > 0.0).mean()),
+        "avg_turnover_per_bar": float(turnovers.mean()),
+        "total_turnover": float(turnovers.sum()),
+        "mean_gross_exposure": float(gross_exposures.mean()),
+        "stop_exits": 0,
+        "take_profit_exits": 0,
+        "filter_exits": 0,
+    }
+    return summary, equity_curve
+
+
+def fast_worst_segment_return(equity_curve: np.ndarray, initial_cash: float, segment_count: int) -> float | None:
+    if equity_curve.size == 0 or segment_count <= 0:
+        return None
+    previous_equity = float(initial_cash)
+    worst = None
+    for index_part in np.array_split(np.arange(len(equity_curve)), segment_count):
+        if index_part.size == 0:
+            continue
+        end_equity = float(equity_curve[index_part[-1]])
+        segment_return = (end_equity / previous_equity - 1.0) * 100.0
+        worst = segment_return if worst is None else min(worst, segment_return)
+        previous_equity = end_equity
+    return worst
+
+
 def fetch_symbol_candles(symbol: str, board: str, interval: int, from_date: str, till_date: str) -> pd.DataFrame:
     session = requests.Session()
     session.trust_env = False
@@ -179,6 +303,7 @@ def select_validation_candidate(
     market_features: dict[str, np.ndarray],
     candidates: list,
     config: dict,
+    validation_engine: str,
 ) -> tuple[dict | None, dict | None, list[dict]]:
     rows = []
     best = None
@@ -193,19 +318,36 @@ def select_validation_candidate(
     )
     for candidate in candidates:
         scores = alpha_scores[candidate.alpha_name]
-        confidence = confidences[(candidate.alpha_name, candidate.mode)]
+        confidence = confidences.get((candidate.alpha_name, candidate.mode))
         policy = stop_policy(candidate)
-        validation_summary, validation_bars = backtest_stop_aware(
-            scores,
-            matrices,
-            masks,
-            market_features,
-            confidence,
-            "validation",
-            policy,
-            initial_cash=float(config["initial_cash"]),
-            cost_bps=float(config["cost_bps"]),
-        )
+        if validation_engine == "fast":
+            validation_summary, validation_curve = fast_backtest_stopless(
+                scores,
+                matrices,
+                masks,
+                "validation",
+                policy,
+                initial_cash=float(config["initial_cash"]),
+                cost_bps=float(config["cost_bps"]),
+            )
+            validation_bars = None
+        elif validation_engine == "full":
+            if confidence is None:
+                raise ValueError(f"missing confidence for {(candidate.alpha_name, candidate.mode)}")
+            validation_summary, validation_bars = backtest_stop_aware(
+                scores,
+                matrices,
+                masks,
+                market_features,
+                confidence,
+                "validation",
+                policy,
+                initial_cash=float(config["initial_cash"]),
+                cost_bps=float(config["cost_bps"]),
+            )
+            validation_curve = None
+        else:
+            raise ValueError(f"unknown validation_engine={validation_engine}")
         raw_score = selection_score(
             validation_summary,
             float(config["drawdown_penalty"]),
@@ -222,13 +364,20 @@ def select_validation_candidate(
         worst_segment = None
         segment_ok = preliminary_ok
         if preliminary_ok and needs_segment:
-            validation_segments = segment_diagnostics(
-                validation_bars,
-                split="validation",
-                initial_cash=float(config["initial_cash"]),
-                segment_count=int(config["segment_count"]),
-            )
-            worst_segment = float(validation_segments["return_pct"].min()) if not validation_segments.empty else None
+            if validation_engine == "fast":
+                worst_segment = fast_worst_segment_return(
+                    validation_curve,
+                    float(config["initial_cash"]),
+                    int(config["segment_count"]),
+                )
+            else:
+                validation_segments = segment_diagnostics(
+                    validation_bars,
+                    split="validation",
+                    initial_cash=float(config["initial_cash"]),
+                    segment_count=int(config["segment_count"]),
+                )
+                worst_segment = float(validation_segments["return_pct"].min()) if not validation_segments.empty else None
             if config.get("min_validation_segment_return_pct") is not None:
                 segment_ok &= worst_segment is not None and worst_segment >= float(
                     config["min_validation_segment_return_pct"]
@@ -237,17 +386,30 @@ def select_validation_candidate(
         validation_stress_summary = {"return_pct": np.nan, "max_drawdown_pct": np.nan}
         stress_ok = preliminary_ok and segment_ok
         if preliminary_ok and segment_ok and needs_stress:
-            validation_stress_summary, _ = backtest_stop_aware(
-                scores,
-                matrices,
-                masks,
-                market_features,
-                confidence,
-                "validation",
-                policy,
-                initial_cash=float(config["initial_cash"]),
-                cost_bps=float(config["stress_cost_bps"]),
-            )
+            if validation_engine == "fast":
+                validation_stress_summary, _ = fast_backtest_stopless(
+                    scores,
+                    matrices,
+                    masks,
+                    "validation",
+                    policy,
+                    initial_cash=float(config["initial_cash"]),
+                    cost_bps=float(config["stress_cost_bps"]),
+                )
+            else:
+                if confidence is None:
+                    raise ValueError(f"missing confidence for {(candidate.alpha_name, candidate.mode)}")
+                validation_stress_summary, _ = backtest_stop_aware(
+                    scores,
+                    matrices,
+                    masks,
+                    market_features,
+                    confidence,
+                    "validation",
+                    policy,
+                    initial_cash=float(config["initial_cash"]),
+                    cost_bps=float(config["stress_cost_bps"]),
+                )
             if config.get("min_validation_stress_return_pct") is not None:
                 stress_ok &= float(validation_stress_summary["return_pct"]) >= float(
                     config["min_validation_stress_return_pct"]
@@ -284,18 +446,31 @@ def select_validation_candidate(
             if record is None:
                 continue
             scores = alpha_scores[record["alpha_name"]]
-            confidence = confidences[(record["alpha_name"], record["mode"])]
-            stress_summary, _ = backtest_stop_aware(
-                scores,
-                matrices,
-                masks,
-                market_features,
-                confidence,
-                "validation",
-                record["policy"],
-                initial_cash=float(config["initial_cash"]),
-                cost_bps=float(config["stress_cost_bps"]),
-            )
+            confidence = confidences.get((record["alpha_name"], record["mode"]))
+            if validation_engine == "fast":
+                stress_summary, _ = fast_backtest_stopless(
+                    scores,
+                    matrices,
+                    masks,
+                    "validation",
+                    record["policy"],
+                    initial_cash=float(config["initial_cash"]),
+                    cost_bps=float(config["stress_cost_bps"]),
+                )
+            else:
+                if confidence is None:
+                    raise ValueError(f"missing confidence for {(record['alpha_name'], record['mode'])}")
+                stress_summary, _ = backtest_stop_aware(
+                    scores,
+                    matrices,
+                    masks,
+                    market_features,
+                    confidence,
+                    "validation",
+                    record["policy"],
+                    initial_cash=float(config["initial_cash"]),
+                    cost_bps=float(config["stress_cost_bps"]),
+                )
             record["validation_stress_return_pct"] = stress_summary["return_pct"]
             record["validation_stress_max_drawdown_pct"] = stress_summary["max_drawdown_pct"]
     return best, best_any, rows
@@ -399,6 +574,7 @@ def main() -> None:
     parser.add_argument("--fetch-days", type=int, default=8)
     parser.add_argument("--fetch-workers", type=int, default=12)
     parser.add_argument("--candidate-log-top-n", type=int, default=0)
+    parser.add_argument("--validation-engine", choices=["fast", "full"], default="fast")
     parser.add_argument("--close-on-exit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -483,11 +659,15 @@ def main() -> None:
                 kinds=parse_csv_strings(config["alpha_kinds"]),
                 normalize=config["alpha_normalize"],
             )
-            confidences = {
-                (alpha_name, mode): score_confidence(scores, matrices["tradable"], mode)
-                for alpha_name, scores in alpha_scores.items()
-                for mode in modes
-            }
+            confidences = (
+                {
+                    (alpha_name, mode): score_confidence(scores, matrices["tradable"], mode)
+                    for alpha_name, scores in alpha_scores.items()
+                    for mode in modes
+                }
+                if args.validation_engine == "full"
+                else {}
+            )
             selected, best_any, search_rows = select_validation_candidate(
                 alpha_scores=alpha_scores,
                 confidences=confidences,
@@ -496,6 +676,7 @@ def main() -> None:
                 market_features=market_features,
                 candidates=candidates,
                 config=config,
+                validation_engine=args.validation_engine,
             )
             cached_decision_candle = latest_ts
             cached_alpha_scores = alpha_scores
@@ -605,6 +786,7 @@ def main() -> None:
                 "trades_json": json.dumps(trades, ensure_ascii=False),
                 "candidate_count": len(search_rows),
                 "constraints_passed_count": int(sum(bool(row["constraints_ok"]) for row in search_rows)),
+                "validation_engine": args.validation_engine,
                 "decision_cache_hit": decision_cache_hit,
                 "decision_elapsed_seconds": decision_elapsed_seconds,
                 "poll_elapsed_seconds": time.perf_counter() - poll_started,
@@ -637,6 +819,7 @@ def main() -> None:
             "selected": {key: value for key, value in (selected or {}).items() if key != "policy"},
             "best_any": {key: value for key, value in (best_any or {}).items() if key != "policy"},
             "constraints_passed_count": int(sum(bool(row["constraints_ok"]) for row in search_rows)),
+            "validation_engine": args.validation_engine,
             "decision_cache_hit": decision_cache_hit,
             "decision_elapsed_seconds": decision_elapsed_seconds,
             "poll_elapsed_seconds": time.perf_counter() - poll_started,
