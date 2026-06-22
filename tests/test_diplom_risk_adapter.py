@@ -98,6 +98,81 @@ def test_stale_days_zero_is_preserved_from_config() -> None:
     assert config.stale_days == 0
 
 
+def test_new_risk_config_fields_are_preserved_from_mapping() -> None:
+    config = config_from_mapping(
+        {
+            "diplom_risk_enabled": True,
+            "diplom_long_p_high_cap": 0.45,
+            "diplom_candidate_score_penalty_pct": 7.5,
+            "diplom_gate_penalty_pct": 3.0,
+        }
+    )
+
+    assert config.long_p_high_cap == 0.45
+    assert config.candidate_score_penalty_pct == 7.5
+    assert config.gate_penalty_pct == 3.0
+
+
+def test_availability_timestamp_controls_asof_lookup() -> None:
+    predictions = pd.DataFrame(
+        [
+            {
+                "decision_date": "2025-12-31",
+                "availability_timestamp": "2025-12-31 23:41:00",
+                "source_data_end": "2025-12-31 23:40:00",
+                "ticker": "AAA",
+                "predicted_risk_class": "low",
+                "p_low": 0.8,
+                "p_medium": 0.1,
+                "p_high": 0.1,
+            },
+            {
+                "decision_date": "2026-01-31",
+                "availability_timestamp": "2026-02-01 10:00:00",
+                "source_data_end": "2026-01-31 23:40:00",
+                "ticker": "AAA",
+                "predicted_risk_class": "high",
+                "p_low": 0.1,
+                "p_medium": 0.2,
+                "p_high": 0.7,
+            },
+        ]
+    )
+    adapter = DiplomRiskAdapter(DiplomRiskConfig(enabled=True, stale_days=999), predictions)
+
+    before = adapter.lookup("AAA", "2026-02-01 09:59:00")
+    after = adapter.lookup("AAA", "2026-02-01 10:00:00")
+
+    assert str(before["decision_date"].date()) == "2025-12-31"
+    assert before["p_high"] == 0.1
+    assert str(after["decision_date"].date()) == "2026-01-31"
+    assert after["p_high"] == 0.7
+    assert after["availability_age_days"] == 0.0
+
+
+def test_staleness_uses_source_data_end_not_availability_only() -> None:
+    predictions = pd.DataFrame(
+        [
+            {
+                "decision_date": "2026-01-31",
+                "availability_timestamp": "2026-02-01 10:00:00",
+                "source_data_end": "2026-01-31 23:40:00",
+                "ticker": "AAA",
+                "predicted_risk_class": "high",
+                "p_low": 0.1,
+                "p_medium": 0.2,
+                "p_high": 0.7,
+            }
+        ]
+    )
+    adapter = DiplomRiskAdapter(DiplomRiskConfig(enabled=True, stale_days=45), predictions)
+
+    lookup = adapter.lookup("AAA", "2026-03-18 12:00:00")
+
+    assert lookup["status"] == "stale"
+    assert lookup["prediction_age_days"] > 45.0
+
+
 def test_invalid_probability_bounds_are_rejected() -> None:
     bad = make_predictions()
     bad.loc[0, "p_high"] = 1.5
@@ -155,3 +230,20 @@ def test_long_veto_zeros_only_long_leg_by_default() -> None:
     assert adjusted[1] == target[1]
     assert diag["diplom_risk_penalty_pct"] == 100.0
     assert "diplom_long_veto" in diag["diplom_risk_reason"]
+
+
+def test_long_p_high_cap_reduces_long_gross_and_reports_diagnostics() -> None:
+    adapter = DiplomRiskAdapter(
+        DiplomRiskConfig(enabled=True, stale_days=999, long_p_high_cap=0.35),
+        make_predictions(),
+    )
+
+    target = np.array([1.0, 0.0], dtype=np.float32)
+    adjusted, diag = adapter.apply_to_target(target, symbols=["AAA", "BBB"], timestamp="2026-01-31")
+
+    assert np.isclose(adjusted[0], 0.5)
+    assert diag["diplom_target_gross_before"] == 1.0
+    assert np.isclose(diag["diplom_target_gross_after"], 0.5)
+    assert np.isclose(diag["diplom_target_gross_reduction_pct"], 50.0)
+    assert np.isclose(diag["diplom_long_p_high_exposure"], 0.7)
+    assert "diplom_long_p_high_cap" in diag["diplom_risk_reason"]

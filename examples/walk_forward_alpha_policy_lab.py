@@ -90,7 +90,10 @@ CONFIG_FIELDS = [
     "diplom_risk_predictions_path",
     "diplom_risk_weight_pct",
     "diplom_long_veto_p_high",
+    "diplom_long_p_high_cap",
     "diplom_short_bonus_weight_pct",
+    "diplom_candidate_score_penalty_pct",
+    "diplom_gate_penalty_pct",
     "diplom_stale_days",
     "diplom_missing_policy",
     "diplom_enable_yndx_ydex_mapping",
@@ -621,6 +624,48 @@ def mode_default_threshold(decision_mode: str, explicit_threshold: float | None)
     if decision_mode == "exploratory":
         return -5.0
     raise ValueError(f"unknown decision_mode={decision_mode}")
+
+
+def diplom_long_risk_exposure(summary: dict) -> float:
+    value = summary.get("diplom_long_p_high_exposure")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = np.nan
+    if not np.isfinite(number):
+        try:
+            number = float(summary.get("diplom_p_high", 0.0))
+        except (TypeError, ValueError):
+            number = 0.0
+    return float(np.clip(number if np.isfinite(number) else 0.0, 0.0, 1.0))
+
+
+def diplom_score_penalty(summary: dict, penalty_pct: float) -> float:
+    if penalty_pct <= 0.0:
+        return 0.0
+    return float(penalty_pct) * diplom_long_risk_exposure(summary)
+
+
+def apply_diplom_gate_penalty(model: dict, gate_summary: dict, penalty_pct: float) -> dict:
+    penalty = diplom_score_penalty(gate_summary, penalty_pct)
+    model["stress_edge_before_diplom_pct"] = float(model["stress_edge_pct"])
+    model["decision_score_before_diplom"] = float(model["decision_score"])
+    model["diplom_gate_penalty_score_pct"] = penalty
+    if penalty <= 0.0:
+        return model
+    model["stress_edge_pct"] = float(model["stress_edge_pct"]) - penalty
+    model["decision_score"] = float(model["decision_score"]) - penalty
+    model["trade_probability"] = sigmoid(float(model["decision_score"]) / max(1.0, float(model["uncertainty_pct"])))
+    current_flags = str(model.get("soft_risk_flags", "") or "")
+    model["soft_risk_flags"] = "diplom_gate_penalty" if not current_flags else f"{current_flags},diplom_gate_penalty"
+    return model
+
+
+def append_soft_risk_flag(model: dict, flag: str) -> None:
+    current_flags = [item for item in str(model.get("soft_risk_flags", "") or "").split(",") if item]
+    if flag not in current_flags:
+        current_flags.append(flag)
+    model["soft_risk_flags"] = ",".join(current_flags)
 
 
 def selection_allowed_by_mode(selection_constraints_ok: bool, decision_mode: str) -> bool:
@@ -1207,7 +1252,8 @@ def gate_trade_passes(
         raise ValueError(f"unknown decision_mode={decision_mode}")
 
     if soft_flags:
-        model["soft_risk_flags"] = ",".join(soft_flags)
+        for flag in soft_flags:
+            append_soft_risk_flag(model, flag)
     return not reasons, ",".join(reasons)
 
 
@@ -1274,7 +1320,10 @@ def main() -> None:
     parser.add_argument("--diplom-risk-predictions-path", type=Path, default=None)
     parser.add_argument("--diplom-risk-weight-pct", type=float, default=0.0)
     parser.add_argument("--diplom-long-veto-p-high", type=float, default=None)
+    parser.add_argument("--diplom-long-p-high-cap", type=float, default=None)
     parser.add_argument("--diplom-short-bonus-weight-pct", type=float, default=0.0)
+    parser.add_argument("--diplom-candidate-score-penalty-pct", type=float, default=0.0)
+    parser.add_argument("--diplom-gate-penalty-pct", type=float, default=0.0)
     parser.add_argument("--diplom-stale-days", type=int, default=45)
     parser.add_argument("--diplom-missing-policy", choices=["neutral", "cash"], default="neutral")
     parser.add_argument("--diplom-enable-yndx-ydex-mapping", action=argparse.BooleanOptionalAction, default=False)
@@ -1426,11 +1475,16 @@ def main() -> None:
                 target_adjuster=diplom_target_adjuster,
             )
             raw_score = selection_score(selection_summary, args.drawdown_penalty, args.turnover_penalty)
-            candidate_score = (
+            selection_score_before_diplom = (
                 raw_score
                 + args.segment_selection_penalty * float(worst_segment if worst_segment is not None else -999.0)
                 + args.stress_selection_weight * float(selection_stress_summary["return_pct"])
             )
+            diplom_candidate_penalty = diplom_score_penalty(
+                selection_summary,
+                diplom_config.candidate_score_penalty_pct,
+            )
+            candidate_score = selection_score_before_diplom - diplom_candidate_penalty
             ok = constraints_pass(
                 selection_summary,
                 selection_stress_summary,
@@ -1454,6 +1508,8 @@ def main() -> None:
                 "validation_stress_max_drawdown_pct": selection_stress_summary["max_drawdown_pct"],
                 "worst_validation_segment_return_pct": worst_segment,
                 "raw_selection_score": raw_score,
+                "selection_score_before_diplom": selection_score_before_diplom,
+                "diplom_candidate_penalty_score_pct": diplom_candidate_penalty,
                 "constraints_ok": ok,
                 "selection_allowed": selection_allowed,
                 "selection_score": selected_score,
@@ -1627,6 +1683,11 @@ def main() -> None:
                 **empty_diplom_summary(),
                 **{key: value for key, value in gate_summary.items() if key.startswith("diplom_")},
             }
+        )
+        apply_diplom_gate_penalty(
+            trade_model,
+            gate_summary,
+            diplom_config.gate_penalty_pct,
         )
         gate_pass, gate_reasons = gate_trade_passes(
             trade_model,
@@ -1862,7 +1923,10 @@ def main() -> None:
             "predictions_path": str(diplom_config.predictions_path) if diplom_config.predictions_path else None,
             "risk_weight_pct": diplom_config.risk_weight_pct,
             "long_veto_p_high": diplom_config.long_veto_p_high,
+            "long_p_high_cap": diplom_config.long_p_high_cap,
             "short_bonus_weight_pct": diplom_config.short_bonus_weight_pct,
+            "candidate_score_penalty_pct": diplom_config.candidate_score_penalty_pct,
+            "gate_penalty_pct": diplom_config.gate_penalty_pct,
             "stale_days": diplom_config.stale_days,
             "missing_policy": diplom_config.missing_policy,
             "enable_yndx_ydex_mapping": diplom_config.enable_yndx_ydex_mapping,
@@ -1943,6 +2007,7 @@ def main() -> None:
         f"- Max May-like regime risk: {args.max_regime_risk}",
         f"- Gate veto windows: {len(gate_vetoed)}",
         f"- Diplom risk enabled: {diplom_config.enabled}",
+        f"- Diplom candidate/gate penalty: {diplom_config.candidate_score_penalty_pct}/{diplom_config.gate_penalty_pct}",
         f"- Diplom changed rebalance decisions: {diplom_changed_decisions}",
         f"- Diplom available/missing/stale rebalances: {diplom_available_decisions}/{diplom_missing_decisions}/{diplom_stale_decisions}",
         f"- Avoided loss: {veto_summary['avoided_loss_pct']:.2f} pct-points",

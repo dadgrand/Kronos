@@ -27,6 +27,8 @@ from walk_forward_alpha_policy_lab import (
     calibration_stats_from_history,
     delay_market_features,
     delay_matrix,
+    apply_diplom_gate_penalty,
+    diplom_score_penalty,
     gate_trade_passes,
     make_diplom_target_adjuster,
     market_regime_profile,
@@ -603,6 +605,12 @@ def select_validation_candidate(
             * float(worst_segment if worst_segment is not None else -999.0)
             + stress_component
         )
+        selection_score_before_diplom = selection
+        diplom_candidate_penalty = diplom_score_penalty(
+            selection_summary,
+            float(config.get("diplom_candidate_score_penalty_pct", 0.0) or 0.0),
+        )
+        selection -= diplom_candidate_penalty
         ok = bool(preliminary_ok and segment_ok and stress_ok)
         selection_allowed = selection_allowed_by_mode(ok, decision_mode)
         row = {
@@ -616,6 +624,8 @@ def select_validation_candidate(
             "worst_validation_segment_return_pct": worst_segment,
             "worst_selection_segment_return_pct": worst_segment,
             "raw_selection_score": raw_score,
+            "selection_score_before_diplom": selection_score_before_diplom,
+            "diplom_candidate_penalty_score_pct": diplom_candidate_penalty,
             "constraints_ok": ok,
             "selection_allowed": selection_allowed,
             "selection_score": selection if selection_allowed else -np.inf,
@@ -730,6 +740,11 @@ def select_validation_candidate(
             **empty_diplom_summary(),
             **{key: value for key, value in gate_summary.items() if key.startswith("diplom_")},
         }
+    )
+    apply_diplom_gate_penalty(
+        trade_model,
+        gate_summary,
+        float(config.get("diplom_gate_penalty_pct", 0.0) or 0.0),
     )
     gate_pass, gate_reasons = gate_trade_passes(
         trade_model,
@@ -1469,7 +1484,10 @@ def main() -> None:
                 "predictions_path": str(diplom_config.predictions_path) if diplom_config.predictions_path else None,
                 "risk_weight_pct": diplom_config.risk_weight_pct,
                 "long_veto_p_high": diplom_config.long_veto_p_high,
+                "long_p_high_cap": diplom_config.long_p_high_cap,
                 "short_bonus_weight_pct": diplom_config.short_bonus_weight_pct,
+                "candidate_score_penalty_pct": diplom_config.candidate_score_penalty_pct,
+                "gate_penalty_pct": diplom_config.gate_penalty_pct,
                 "stale_days": diplom_config.stale_days,
                 "missing_policy": diplom_config.missing_policy,
                 "enable_yndx_ydex_mapping": diplom_config.enable_yndx_ydex_mapping,
