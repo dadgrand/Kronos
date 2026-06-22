@@ -1,0 +1,50 @@
+{
+  "created_at": "2026-06-22T13:40:53",
+  "scores_path": [
+    "outputs\\neural_policy_lab_h12_seed20260622_20260622_132851\\scores.npy",
+    "outputs\\neural_policy_lab_h12_seed20260623_20260622_133133\\scores.npy",
+    "outputs\\neural_policy_lab_h12_seed20260624_20260622_133615\\scores.npy"
+  ],
+  "dataset_dir": "datasets\\moex_intraday_6f8f836cc811",
+  "train_end": "2026-06-01",
+  "validation_end": "2026-06-13",
+  "selected_policy": {
+    "mode": "short_only",
+    "k": 1,
+    "gross": 4.0,
+    "rebalance_every": 24,
+    "confidence_min": 0.07741670683026314,
+    "market_mom_24_max": 0.002567113547411282,
+    "market_mom_96_max": 3.8395675483115644e-05
+  },
+  "validation_summary": {
+    "split": "validation",
+    "initial_cash": 10000.0,
+    "final_equity": 18757.80001888173,
+    "pnl": 8757.800018881731,
+    "return_pct": 87.57800018881731,
+    "max_drawdown_pct": -8.234869924554712,
+    "sharpe_like": 7.1531472348067595,
+    "bars": 1083,
+    "active_rate": 0.3988919667590028,
+    "avg_turnover_per_bar": 0.12557710064635272,
+    "total_turnover": 136.0,
+    "mean_gross_exposure": 1.5955678670360112
+  },
+  "test_summary": {
+    "split": "test",
+    "initial_cash": 10000.0,
+    "final_equity": 13483.021925276018,
+    "pnl": 3483.021925276018,
+    "return_pct": 34.83021925276017,
+    "max_drawdown_pct": -18.53643676522825,
+    "sharpe_like": 5.30536338225461,
+    "bars": 620,
+    "active_rate": 0.4645161290322581,
+    "avg_turnover_per_bar": 0.15483870967741936,
+    "total_turnover": 96.0,
+    "mean_gross_exposure": 1.8580645161290323
+  },
+  "target_30pct_hit": true,
+  "protocol": "Filter thresholds are selected on validation only. Test is evaluated after filter selection."
+}

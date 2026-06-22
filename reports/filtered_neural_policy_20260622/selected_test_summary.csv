@@ -1,0 +1,2 @@
+split,initial_cash,final_equity,pnl,return_pct,max_drawdown_pct,sharpe_like,bars,active_rate,avg_turnover_per_bar,total_turnover,mean_gross_exposure
+test,10000.0,13967.832957861086,3967.8329578610865,39.67832957861086,-18.53643676522828,6.097812388777996,620,0.4258064516129032,0.14193548387096774,88.0,1.7032258064516128
