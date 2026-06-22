@@ -135,3 +135,13 @@ It is not yet a production proof. The policy remains short-only and one-symbol c
 - `cost_sensitivity.csv`: test sensitivity to execution costs.
 
 Forward live-paper runs now also produce `candidate_log.csv`, which records every symbol's score, rank, live/candle price, tradability, and selected-candidate flag at each poll. That file is the required artifact for evaluating target switches and missed alternatives after a live run.
+
+## Candidate Log Analysis
+
+```powershell
+.\.venv\Scripts\python.exe examples\analyze_live_candidate_log.py `
+  --run-dir outputs\live_paper_policy_candidate_log_smoke_20260622 `
+  --output-dir outputs\live_candidate_analysis_smoke_20260622
+```
+
+The smoke analysis is saved in `reports/live_candidate_analysis_smoke_20260622`. It verifies 50 candidate rows for one poll, 100% price coverage, 100% tradability, and candidate consistency `1/1`.

@@ -1,0 +1,25 @@
+{
+  "run_dir": "outputs\\live_paper_policy_candidate_log_smoke_20260622",
+  "live_log_rows": 2,
+  "candidate_log_rows": 50,
+  "candidate_polls": 1,
+  "unique_symbols": 50,
+  "avg_symbols_per_poll": 50.0,
+  "price_coverage": 1.0,
+  "tradable_rate": 1.0,
+  "selected_candidate_rows": 1,
+  "final_equity_after_close": 9970.0,
+  "final_return_pct_after_close": -0.30000000000000027,
+  "candidate_consistency_matches": 1,
+  "candidate_consistency_checks": 1,
+  "one_step_rows": 0,
+  "candidate_consistency": [
+    {
+      "wall_time": "2026-06-22T15:51:45",
+      "candidate_symbol": "PIKK",
+      "logged_selected_symbol": "PIKK",
+      "matches_candidate_log": true
+    }
+  ],
+  "one_step_summary": {}
+}

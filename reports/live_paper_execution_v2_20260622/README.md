@@ -14,6 +14,12 @@ It keeps the neural score ensemble from the research pipeline, but changes the l
 - can load a frozen research policy with `--policy-json`, including gross, mode, confidence, and market-regime gates.
 - writes `candidate_log.csv` with per-symbol scores, ranks, prices, tradability, and selected-candidate flags for replayable forward analysis.
 
+Post-run candidate analysis:
+
+```powershell
+python examples/analyze_live_candidate_log.py --run-dir <live-output-dir> --output-dir <analysis-output-dir>
+```
+
 ## Conservative live paper command
 
 ```powershell
