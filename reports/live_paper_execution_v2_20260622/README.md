@@ -7,7 +7,8 @@ It keeps the neural score ensemble from the research pipeline, but changes the l
 - supports `short_only`, `long_only`, and `long_short` candidate selection;
 - defaults to safer `max_gross=1.0` instead of the research backtest's 4x gross;
 - gates entries by a cost-aware confidence proxy;
-- exits early on stop-loss, take-profit, weak/blocked filter, or target switch;
+- exits early on stop-loss, take-profit, or target switch;
+- can optionally close after N consecutive weak/blocked filter signals with `--exit-on-filter-fail --filter-fail-exit-bars N`;
 - closes any remaining paper position at the end of the run and reports realized final equity;
 - logs every action with candidate, edge estimate, turnover, costs, and equity.
 

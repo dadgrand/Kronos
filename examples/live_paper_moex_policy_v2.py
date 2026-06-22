@@ -42,6 +42,9 @@ class Candidate:
     reason: str
 
 
+BLOCKING_CANDIDATE_REASONS = {"filter_blocked", "edge_below_cost_gate", "no_tradable_price"}
+
+
 def finite_price(value: object) -> float | None:
     try:
         price = float(value)
@@ -194,6 +197,8 @@ def decide_action(
     stop_loss_pct: float,
     take_profit_pct: float,
     exit_on_filter_fail: bool,
+    filter_fail_count: int,
+    filter_fail_exit_bars: int,
     switch_target: bool,
 ) -> tuple[str, str | None, float]:
     if state.symbol is None:
@@ -209,8 +214,12 @@ def decide_action(
         return "close_stop_loss", None, 0.0
     if position_return_pct >= abs(take_profit_pct):
         return "close_take_profit", None, 0.0
-    if exit_on_filter_fail and candidate.reason in {"filter_blocked", "edge_below_cost_gate", "no_tradable_price"}:
-        return f"close_{candidate.reason}", None, 0.0
+    if (
+        exit_on_filter_fail
+        and candidate.reason in BLOCKING_CANDIDATE_REASONS
+        and filter_fail_count >= max(1, filter_fail_exit_bars)
+    ):
+        return f"close_{candidate.reason}_{filter_fail_count}bars", None, 0.0
     if switch_target and candidate.symbol and candidate.symbol != state.symbol:
         return f"switch_to_{candidate.reason}", candidate.symbol, candidate.weight
 
@@ -232,7 +241,8 @@ def main() -> None:
     parser.add_argument("--min-expected-edge-bps", type=float, default=10.0)
     parser.add_argument("--stop-loss-pct", type=float, default=0.75)
     parser.add_argument("--take-profit-pct", type=float, default=0.75)
-    parser.add_argument("--exit-on-filter-fail", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--exit-on-filter-fail", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--filter-fail-exit-bars", type=int, default=3)
     parser.add_argument("--switch-target", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--close-on-exit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", default="cuda:0")
@@ -266,6 +276,7 @@ def main() -> None:
     state = PositionState()
     total_cost = 0.0
     total_turnover = 0.0
+    filter_fail_count = 0
     rows = []
     start_time = time.time()
     end_time = start_time + args.duration_minutes * 60.0
@@ -313,6 +324,10 @@ def main() -> None:
             required_edge_bps=required_edge_bps,
             filter_pass=filter_pass,
         )
+        if candidate.reason in BLOCKING_CANDIDATE_REASONS:
+            filter_fail_count += 1
+        else:
+            filter_fail_count = 0
 
         equity_before, mark_price_before = mark_equity(cash, state, prices)
         action, target_symbol, target_weight = decide_action(
@@ -323,6 +338,8 @@ def main() -> None:
             stop_loss_pct=args.stop_loss_pct,
             take_profit_pct=args.take_profit_pct,
             exit_on_filter_fail=args.exit_on_filter_fail,
+            filter_fail_count=filter_fail_count,
+            filter_fail_exit_bars=args.filter_fail_exit_bars,
             switch_target=args.switch_target,
         )
 
@@ -372,6 +389,7 @@ def main() -> None:
             "candidate_edge_bps": candidate.confidence_edge_bps,
             "candidate_reason": candidate.reason,
             "filter_pass": filter_pass,
+            "filter_fail_count": filter_fail_count,
             "market_mom_24": market_mom_24,
             "market_mom_96": market_mom_96,
             "trade_cost": cost,
@@ -428,6 +446,7 @@ def main() -> None:
                 "candidate_edge_bps": candidate.confidence_edge_bps,
                 "candidate_reason": candidate.reason,
                 "filter_pass": filter_pass,
+                "filter_fail_count": filter_fail_count,
                 "market_mom_24": market_mom_24,
                 "market_mom_96": market_mom_96,
                 "trade_cost": final_close_cost,
@@ -461,6 +480,7 @@ def main() -> None:
             "stop_loss_pct": args.stop_loss_pct,
             "take_profit_pct": args.take_profit_pct,
             "exit_on_filter_fail": args.exit_on_filter_fail,
+            "filter_fail_exit_bars": args.filter_fail_exit_bars,
             "switch_target": args.switch_target,
             "close_on_exit": args.close_on_exit,
         },
