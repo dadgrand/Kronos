@@ -375,29 +375,167 @@
             color: #718096;
         }
 
-        .loading {
+        .pipeline-progress {
             display: none;
-            text-align: center;
-            padding: 20px;
+            margin: 14px 0 20px;
+            padding: 16px;
+            border: 1px solid #d9e2f3;
+            border-radius: 10px;
+            background:
+                linear-gradient(135deg, rgba(102, 126, 234, 0.1), rgba(72, 187, 120, 0.08)),
+                #f8fbff;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.8);
         }
 
-        .loading.show {
+        .pipeline-progress.show {
             display: block;
         }
 
-        .spinner {
-            border: 4px solid #f3f3f3;
-            border-top: 4px solid #667eea;
-            border-radius: 50%;
-            width: 40px;
-            height: 40px;
-            animation: spin 1s linear infinite;
-            margin: 0 auto 10px;
+        .pipeline-progress.running {
+            border-color: #90cdf4;
         }
 
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
+        .pipeline-progress.success {
+            border-color: #9ae6b4;
+            background:
+                linear-gradient(135deg, rgba(72, 187, 120, 0.16), rgba(56, 161, 105, 0.08)),
+                #f0fff4;
+        }
+
+        .pipeline-progress.error {
+            border-color: #feb2b2;
+            background:
+                linear-gradient(135deg, rgba(245, 101, 101, 0.13), rgba(237, 137, 54, 0.08)),
+                #fff5f5;
+        }
+
+        .progress-header {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+
+        .progress-title {
+            font-size: 0.95rem;
+            font-weight: 700;
+            color: #2d3748;
+            line-height: 1.3;
+        }
+
+        .progress-phase {
+            margin-top: 3px;
+            color: #4a5568;
+            font-size: 0.82rem;
+            line-height: 1.35;
+        }
+
+        .progress-value {
+            min-width: 46px;
+            text-align: right;
+            font-size: 1rem;
+            font-weight: 800;
+            color: #667eea;
+        }
+
+        .pipeline-progress.success .progress-value {
+            color: #2f855a;
+        }
+
+        .pipeline-progress.error .progress-value {
+            color: #c53030;
+        }
+
+        .progress-track {
+            position: relative;
+            height: 12px;
+            overflow: hidden;
+            border-radius: 999px;
+            background: #e2e8f0;
+            box-shadow: inset 0 1px 2px rgba(0,0,0,0.12);
+        }
+
+        .progress-fill {
+            width: 0%;
+            height: 100%;
+            border-radius: inherit;
+            background: linear-gradient(90deg, #667eea 0%, #48bb78 100%);
+            transition: width 0.35s ease;
+        }
+
+        .pipeline-progress.running .progress-fill::after {
+            content: '';
+            display: block;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.42), transparent);
+            animation: progressShimmer 1.4s infinite;
+        }
+
+        .pipeline-progress.success .progress-fill {
+            background: linear-gradient(90deg, #48bb78 0%, #38a169 100%);
+        }
+
+        .pipeline-progress.error .progress-fill {
+            background: linear-gradient(90deg, #f56565 0%, #ed8936 100%);
+        }
+
+        .progress-meta {
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+            margin-top: 9px;
+            color: #718096;
+            font-size: 0.76rem;
+            line-height: 1.35;
+        }
+
+        .progress-pulse {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            white-space: nowrap;
+        }
+
+        .progress-pulse::before {
+            content: '';
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #667eea;
+            box-shadow: 0 0 0 rgba(102, 126, 234, 0.5);
+            animation: pulse 1.4s infinite;
+        }
+
+        .pipeline-progress.success .progress-pulse::before {
+            background: #38a169;
+            animation: none;
+        }
+
+        .pipeline-progress.error .progress-pulse::before {
+            background: #e53e3e;
+            animation: none;
+        }
+
+        .pipeline-progress-native {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            overflow: hidden;
+            clip: rect(0 0 0 0);
+            white-space: nowrap;
+        }
+
+        @keyframes progressShimmer {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+        }
+
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(102, 126, 234, 0.45); }
+            70% { box-shadow: 0 0 0 8px rgba(102, 126, 234, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(102, 126, 234, 0); }
         }
 
         .model-info {
@@ -434,6 +572,20 @@
             
             .header h1 {
                 font-size: 2rem;
+            }
+
+            .progress-header,
+            .progress-meta {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .progress-value {
+                text-align: left;
+            }
+
+            .progress-pulse {
+                white-space: normal;
             }
         }
     </style>
@@ -569,10 +721,32 @@
                     🔮 Start Prediction
                 </button>
 
-                <!-- Loading Status -->
-                <div id="loading" class="loading">
-                    <div class="spinner"></div>
-                    <p>Processing, please wait...</p>
+                <!-- Pipeline Progress -->
+                <div id="pipeline-progress" class="pipeline-progress" aria-live="polite">
+                    <div class="progress-header">
+                        <div>
+                            <div id="progress-title" class="progress-title">Pipeline progress</div>
+                            <div id="progress-phase" class="progress-phase">Waiting to start</div>
+                        </div>
+                        <div id="progress-value" class="progress-value">0%</div>
+                    </div>
+                    <div
+                        class="progress-track"
+                        role="progressbar"
+                        aria-label="Pipeline progress"
+                        aria-valuemin="0"
+                        aria-valuemax="100"
+                        aria-valuenow="0"
+                        aria-valuetext="Waiting to start">
+                        <div id="progress-fill" class="progress-fill"></div>
+                    </div>
+                    <progress id="progress-native" class="pipeline-progress-native" max="100" value="0">
+                        0%
+                    </progress>
+                    <div class="progress-meta">
+                        <span id="progress-detail">Phase-based estimate; final completion waits for the server response.</span>
+                        <span id="progress-state" class="progress-pulse">Idle</span>
+                    </div>
                 </div>
             </div>
 
@@ -640,6 +814,124 @@
         let availableModels = [];
         let modelLoaded = false;
 
+        const pipelineProgress = {
+            timer: null,
+            startedAt: 0,
+            value: 0,
+            phases: [],
+            currentPhaseIndex: 0,
+            runningLabel: 'Running',
+
+            definitions: {
+                prediction: {
+                    title: 'Prediction pipeline',
+                    runningLabel: 'Running prediction',
+                    phases: [
+                        { at: 0, value: 8, label: 'Validating inputs', detail: 'Checking selected file, model, and time window.' },
+                        { at: 700, value: 18, label: 'Preparing request', detail: 'Collecting prediction parameters for the selected window.' },
+                        { at: 1600, value: 34, label: 'Sending request to server', detail: 'The Kronos prediction request is in progress.' },
+                        { at: 3200, value: 58, label: 'Running model inference', detail: 'Estimated phase progress; exact model internals are not streamed by the backend.' },
+                        { at: 8500, value: 78, label: 'Building result data', detail: 'Waiting for chart and comparison data from the server.' },
+                        { at: 16000, value: 88, label: 'Still working', detail: 'The model is still processing. Completion is shown only after a successful response.' }
+                    ]
+                },
+                model: {
+                    title: 'Model loading',
+                    runningLabel: 'Loading model',
+                    phases: [
+                        { at: 0, value: 10, label: 'Validating model selection', detail: 'Checking selected model and device.' },
+                        { at: 800, value: 26, label: 'Requesting model load', detail: 'Sending tokenizer and model initialization request.' },
+                        { at: 2200, value: 52, label: 'Loading model artifacts', detail: 'This can include local cache reads or first-time downloads.' },
+                        { at: 6500, value: 76, label: 'Initializing predictor', detail: 'Preparing Kronos predictor on the selected device.' },
+                        { at: 13000, value: 88, label: 'Still loading', detail: 'The model is still initializing. Completion waits for the server response.' }
+                    ]
+                }
+            },
+
+            start(operation) {
+                this.stop();
+                const definition = this.definitions[operation];
+                this.startedAt = Date.now();
+                this.value = 0;
+                this.phases = definition.phases;
+                this.currentPhaseIndex = 0;
+                this.runningLabel = definition.runningLabel;
+
+                const panel = document.getElementById('pipeline-progress');
+                panel.className = 'pipeline-progress show running';
+                document.getElementById('progress-title').textContent = definition.title;
+                document.getElementById('progress-state').textContent = this.runningLabel;
+                this.render(this.phases[0].value, this.phases[0].label, this.phases[0].detail);
+
+                this.timer = setInterval(() => this.tick(), 500);
+            },
+
+            tick() {
+                const elapsed = Date.now() - this.startedAt;
+                let phaseIndex = this.currentPhaseIndex;
+
+                for (let i = 0; i < this.phases.length; i++) {
+                    if (elapsed >= this.phases[i].at) {
+                        phaseIndex = i;
+                    }
+                }
+
+                this.currentPhaseIndex = phaseIndex;
+                const phase = this.phases[phaseIndex];
+                const nextPhase = this.phases[phaseIndex + 1];
+                const phaseStart = phase.at;
+                const phaseEnd = nextPhase ? nextPhase.at : phaseStart + 10000;
+                const phaseRatio = Math.max(0, Math.min(1, (elapsed - phaseStart) / Math.max(1, phaseEnd - phaseStart)));
+                const target = nextPhase ? phase.value + ((nextPhase.value - phase.value) * phaseRatio) : Math.min(94, phase.value + (phaseRatio * 6));
+
+                this.render(Math.max(this.value, target), phase.label, phase.detail);
+            },
+
+            markResponseReceived(message) {
+                this.render(Math.max(this.value, 92), 'Preparing chart and analysis', message || 'Server response received; rendering the result.');
+            },
+
+            complete(message) {
+                this.stop();
+                const panel = document.getElementById('pipeline-progress');
+                panel.className = 'pipeline-progress show success';
+                document.getElementById('progress-state').textContent = 'Complete';
+                this.render(100, 'Completed', message || 'Pipeline completed successfully.');
+            },
+
+            fail(message) {
+                this.stop();
+                const panel = document.getElementById('pipeline-progress');
+                panel.className = 'pipeline-progress show error';
+                document.getElementById('progress-state').textContent = 'Failed';
+                this.render(Math.max(this.value, 12), 'Failed', message);
+            },
+
+            stop() {
+                if (this.timer) {
+                    clearInterval(this.timer);
+                    this.timer = null;
+                }
+            },
+
+            render(value, label, detail) {
+                this.value = Math.max(0, Math.min(100, Math.round(value)));
+                document.getElementById('progress-phase').textContent = label;
+                document.getElementById('progress-detail').textContent = detail || '';
+                document.getElementById('progress-value').textContent = `${this.value}%`;
+                document.getElementById('progress-fill').style.width = `${this.value}%`;
+
+                const track = document.querySelector('.progress-track');
+                const valueText = `${label}. ${detail || ''}`;
+                track.setAttribute('aria-valuenow', String(this.value));
+                track.setAttribute('aria-valuetext', valueText);
+
+                const nativeProgress = document.getElementById('progress-native');
+                nativeProgress.value = this.value;
+                nativeProgress.textContent = `${this.value}%`;
+            }
+        };
+
         // Initialize after page loads
         document.addEventListener('DOMContentLoaded', function() {
             initializeApp();
@@ -677,7 +969,7 @@
                     showStatus('warning', 'Kronos model library not available, will use simulated prediction');
                 }
             } catch (error) {
-                console.error('❌ Failed to load available models:', error);
+                console.warn('⚠️ Failed to load available models:', error);
                 showStatus('error', 'Failed to load available models');
             }
         }
@@ -706,7 +998,7 @@
             }
             
             try {
-                showLoading(true);
+                pipelineProgress.start('model');
                 document.getElementById('load-model-btn').disabled = true;
                 
                 const response = await axios.post('/api/load-model', {
@@ -715,19 +1007,23 @@
                 });
                 
                 if (response.data.success) {
+                    pipelineProgress.markResponseReceived('Model loaded; updating local status.');
                     modelLoaded = true;
                     showStatus('success', response.data.message);
                     updateModelStatus();
                     document.getElementById('predict-btn').disabled = false;
+                    pipelineProgress.complete(response.data.message);
                     console.log('✅ Model loaded successfully:', response.data.model_info);
                 } else {
+                    pipelineProgress.fail(response.data.error || 'Model loading failed');
                     showStatus('error', response.data.error);
                 }
             } catch (error) {
-                console.error('❌ Model loading failed:', error);
-                showStatus('error', `Model loading failed: ${error.response?.data?.error || error.message}`);
+                console.warn('⚠️ Model loading failed:', error);
+                const errorMessage = `Model loading failed: ${error.response?.data?.error || error.message}`;
+                pipelineProgress.fail(errorMessage);
+                showStatus('error', errorMessage);
             } finally {
-                showLoading(false);
                 document.getElementById('load-model-btn').disabled = false;
             }
         }
@@ -746,7 +1042,7 @@
                     showStatus('warning', 'Model library not available');
                 }
             } catch (error) {
-                console.error('❌ Failed to get model status:', error);
+                console.warn('⚠️ Failed to get model status:', error);
             }
         }
 
@@ -768,7 +1064,7 @@
                 
                 console.log('✅ Data file list loaded successfully:', dataFiles);
             } catch (error) {
-                console.error('❌ Failed to load data file list:', error);
+                console.warn('⚠️ Failed to load data file list:', error);
                 showStatus('error', 'Failed to load data file list');
             }
         }
@@ -783,7 +1079,6 @@
             }
             
             try {
-                showLoading(true);
                 document.getElementById('load-data-btn').disabled = true;
                 
                 const response = await axios.post('/api/load-data', {
@@ -806,10 +1101,9 @@
                     showStatus('error', response.data.error);
                 }
             } catch (error) {
-                console.error('❌ Data loading failed:', error);
+                console.warn('⚠️ Data loading failed:', error);
                 showStatus('error', `Data loading failed: ${error.response?.data?.error || error.message}`);
             } finally {
-                showLoading(false);
                 document.getElementById('load-data-btn').disabled = false;
             }
         }
@@ -1041,7 +1335,12 @@
             }
             
             try {
-                showLoading(true);
+                if (!sliderData) {
+                    showStatus('error', 'Time window slider not initialized');
+                    return;
+                }
+
+                pipelineProgress.start('prediction');
                 document.getElementById('predict-btn').disabled = true;
                 
                 const lookback = parseInt(document.getElementById('lookback').value);
@@ -1050,11 +1349,6 @@
                 // Get selected time range from time window slider
                 const startHandle = document.getElementById('start-handle');
                 const startPercentage = parseFloat(startHandle.style.left) / 100;
-                
-                if (!sliderData) {
-                    showStatus('error', 'Time window slider not initialized');
-                    return;
-                }
                 
                 // Calculate selected time range
                 const totalTime = sliderData.endDate.getTime() - sliderData.startDate.getTime();
@@ -1081,17 +1375,22 @@
                 const response = await axios.post('/api/predict', predictionParams);
                 
                 if (response.data.success) {
+                    pipelineProgress.markResponseReceived('Prediction response received; rendering chart and comparison analysis.');
                     // Display prediction results
                     displayPredictionResult(response.data);
                     showStatus('success', response.data.message);
+                    pipelineProgress.complete(response.data.message);
                 } else {
-                    showStatus('error', response.data.error);
+                    const errorMessage = response.data.error || 'Prediction failed';
+                    pipelineProgress.fail(errorMessage);
+                    showStatus('error', errorMessage);
                 }
             } catch (error) {
-                console.error('❌ Prediction failed:', error);
-                showStatus('error', `Prediction failed: ${error.response?.data?.error || error.message}`);
+                console.warn('⚠️ Prediction failed:', error);
+                const errorMessage = `Prediction failed: ${error.response?.data?.error || error.message}`;
+                pipelineProgress.fail(errorMessage);
+                showStatus('error', errorMessage);
             } finally {
-                showLoading(false);
                 document.getElementById('predict-btn').disabled = false;
             }
         }
@@ -1224,15 +1523,7 @@
             }, 5000);
         }
 
-        // Show/hide loading status
-        function showLoading(show) {
-            const loadingDiv = document.getElementById('loading');
-            if (show) {
-                loadingDiv.classList.add('show');
-            } else {
-                loadingDiv.classList.remove('show');
-            }
-        }
+        // The pipeline progress panel owns long-running operation feedback.
     </script>
 </body>
 </html>
